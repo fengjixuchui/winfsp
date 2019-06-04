@@ -29,7 +29,7 @@ static NTSTATUS FspFsvolCreate(
     PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 static NTSTATUS FspFsvolCreateNoLock(
     PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp,
-    BOOLEAN MainFileOpen);
+    BOOLEAN MainFileOpen, PFSP_ATOMIC_CREATE_ECP_CONTEXT AtomicCreateEcp);
 FSP_IOPREP_DISPATCH FspFsvolCreatePrepare;
 FSP_IOCMPL_DISPATCH FspFsvolCreateComplete;
 static NTSTATUS FspFsvolCreateTryOpen(PIRP Irp, const FSP_FSCTL_TRANSACT_RSP *Response,
@@ -144,6 +144,7 @@ static NTSTATUS FspFsvolCreate(
     PECP_LIST ExtraCreateParameters;
     PVOID ExtraCreateParameter;
     BOOLEAN MainFileOpen = FALSE;
+    PFSP_ATOMIC_CREATE_ECP_CONTEXT AtomicCreateEcp = 0;
 
     /*
      * Check if the IRP has ECP's.
@@ -219,6 +220,21 @@ static NTSTATUS FspFsvolCreate(
             }
         }
 #endif
+
+        if (FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.WslFeatures)
+        {
+            // {4720bd83-52ac-4104-a130-d1ec6a8cc8e5}
+            static const GUID FspAtomicCreateEcpGuid =
+                { 0x4720bd83, 0x52ac, 0x4104, { 0xa1, 0x30, 0xd1, 0xec, 0x6a, 0x8c, 0xc8, 0xe5 } };
+
+            ExtraCreateParameter = 0;
+            AtomicCreateEcp =
+                NT_SUCCESS(FsRtlFindExtraCreateParameter(ExtraCreateParameters,
+                    &FspAtomicCreateEcpGuid, &ExtraCreateParameter, 0)) &&
+                0 != ExtraCreateParameter &&
+                !FsRtlIsEcpFromUserMode(ExtraCreateParameter) ?
+                    ExtraCreateParameter : 0;
+        }
     }
 
     if (!MainFileOpen)
@@ -226,7 +242,8 @@ static NTSTATUS FspFsvolCreate(
         FspFsvolDeviceFileRenameAcquireShared(FsvolDeviceObject);
         try
         {
-            Result = FspFsvolCreateNoLock(FsvolDeviceObject, Irp, IrpSp, FALSE);
+            Result = FspFsvolCreateNoLock(FsvolDeviceObject, Irp, IrpSp,
+                MainFileOpen, AtomicCreateEcp);
         }
         finally
         {
@@ -235,14 +252,15 @@ static NTSTATUS FspFsvolCreate(
         }
     }
     else
-        Result = FspFsvolCreateNoLock(FsvolDeviceObject, Irp, IrpSp, TRUE);
+        Result = FspFsvolCreateNoLock(FsvolDeviceObject, Irp, IrpSp,
+            MainFileOpen, AtomicCreateEcp);
 
     return Result;
 }
 
 static NTSTATUS FspFsvolCreateNoLock(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp,
-    BOOLEAN MainFileOpen)
+    BOOLEAN MainFileOpen, PFSP_ATOMIC_CREATE_ECP_CONTEXT AtomicCreateEcp)
 {
     PAGED_CODE();
 
@@ -278,7 +296,9 @@ static NTSTATUS FspFsvolCreateNoLock(
     ACCESS_MASK GrantedAccess = AccessState->PreviouslyGrantedAccess;
     USHORT ShareAccess = IrpSp->Parameters.Create.ShareAccess;
     PFILE_FULL_EA_INFORMATION EaBuffer = Irp->AssociatedIrp.SystemBuffer;
-    //ULONG EaLength = IrpSp->Parameters.Create.EaLength;
+    ULONG EaLength = IrpSp->Parameters.Create.EaLength;
+    PVOID ExtraBuffer = 0;
+    ULONG ExtraLength = 0;
     ULONG Flags = IrpSp->Flags;
     KPROCESSOR_MODE RequestorMode =
         FlagOn(Flags, SL_FORCE_ACCESS_CHECK) ? UserMode : Irp->RequestorMode;
@@ -292,6 +312,7 @@ static NTSTATUS FspFsvolCreateNoLock(
     BOOLEAN HasRestorePrivilege =
         BooleanFlagOn(AccessState->Flags, TOKEN_HAS_RESTORE_PRIVILEGE);
     BOOLEAN HasTrailingBackslash = FALSE;
+    BOOLEAN EaIsReparsePoint = FALSE;
     FSP_FILE_NODE *FileNode, *RelatedFileNode;
     FSP_FILE_DESC *FileDesc;
     UNICODE_STRING MainFileName = { 0 }, StreamPart = { 0 };
@@ -302,9 +323,56 @@ static NTSTATUS FspFsvolCreateNoLock(
     if (FlagOn(CreateOptions, FILE_OPEN_BY_FILE_ID))
         return STATUS_NOT_IMPLEMENTED;
 
-    /* no EA support currently */
+    /* is there an AtomicCreateEcp attached? */
+    if (0 != AtomicCreateEcp)
+    {
+        if ((FILE_CREATE != CreateDisposition && FILE_OPEN_IF != CreateDisposition) ||
+            0 != EaBuffer ||
+            RTL_SIZEOF_THROUGH_FIELD(FSP_ATOMIC_CREATE_ECP_CONTEXT, ReparseBuffer) >
+                AtomicCreateEcp->Size ||
+            /* !!!: revisit: FlagOn*/
+            !FlagOn(AtomicCreateEcp->InFlags,
+                ATOMIC_CREATE_ECP_IN_FLAG_BEST_EFFORT |
+                ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED))
+            return STATUS_INVALID_PARAMETER; /* docs do not say what to return on failure! */
+
+        if (FlagOn(AtomicCreateEcp->InFlags,
+            ATOMIC_CREATE_ECP_IN_FLAG_REPARSE_POINT_SPECIFIED))
+        {
+            Result = FsRtlValidateReparsePointBuffer(AtomicCreateEcp->ReparseBufferLength,
+                AtomicCreateEcp->ReparseBuffer);
+            if (!NT_SUCCESS(Result))
+                return Result;
+
+            /* mark that we satisfied the reparse point request, although we may fail it later! */
+            AtomicCreateEcp->OutFlags = ATOMIC_CREATE_ECP_OUT_FLAG_REPARSE_POINT_SET;
+
+            ExtraBuffer = AtomicCreateEcp->ReparseBuffer;
+            ExtraLength = AtomicCreateEcp->ReparseBufferLength;
+            EaIsReparsePoint = TRUE;
+        }
+    }
+
+    /* was an EA buffer specified? */
     if (0 != EaBuffer)
-        return STATUS_EAS_NOT_SUPPORTED;
+    {
+        /* does the file system support EA? */
+        if (!FsvolDeviceExtension->VolumeParams.ExtendedAttributes)
+            return STATUS_EAS_NOT_SUPPORTED;
+
+        /* do we need EA knowledge? */
+        if (FlagOn(CreateOptions, FILE_NO_EA_KNOWLEDGE))
+            return STATUS_ACCESS_DENIED;
+
+        /* is the EA buffer valid? */
+        Result = FspEaBufferFromOriginatingProcessValidate(
+            EaBuffer, EaLength, (PULONG)&Irp->IoStatus.Information);
+        if (!NT_SUCCESS(Result))
+            return Result;
+
+        ExtraBuffer = EaBuffer;
+        ExtraLength = EaLength;
+    }
 
     /* cannot open a paging file */
     if (FlagOn(Flags, SL_OPEN_PAGING_FILE))
@@ -541,6 +609,10 @@ static NTSTATUS FspFsvolCreateNoLock(
         SecurityDescriptorSize = 0;
         FileAttributes = 0;
 
+        /* cannot set extra buffer on named stream */
+        ExtraBuffer = 0;
+        ExtraLength = 0;
+
         /* remember the main file node */
         ASSERT(0 == FileNode->MainFileNode);
         FileNode->MainFileNode = FileDesc->MainFileObject->FsContext;
@@ -558,7 +630,9 @@ static NTSTATUS FspFsvolCreateNoLock(
     }
 
     /* create the user-mode file system request */
-    Result = FspIopCreateRequestEx(Irp, &FileNode->FileName, SecurityDescriptorSize,
+    Result = FspIopCreateRequestEx(Irp, &FileNode->FileName,
+        0 != ExtraBuffer ?
+            FSP_FSCTL_DEFAULT_ALIGN_UP(SecurityDescriptorSize) + ExtraLength : SecurityDescriptorSize,
         FspFsvolCreateRequestFini, &Request);
     if (!NT_SUCCESS(Result))
     {
@@ -584,19 +658,22 @@ static NTSTATUS FspFsvolCreateNoLock(
     FspIopRequestContext(Request, RequestFileDesc) = FileDesc;
 
     /* populate the Create request */
+#define NEXTOFS(B)                      ((B).Offset + FSP_FSCTL_DEFAULT_ALIGN_UP((B).Size))
     Request->Kind = FspFsctlTransactCreateKind;
     Request->Req.Create.CreateOptions = CreateOptions;
     Request->Req.Create.FileAttributes = FileAttributes;
-    Request->Req.Create.SecurityDescriptor.Offset = 0 == SecurityDescriptorSize ? 0 :
-        FSP_FSCTL_DEFAULT_ALIGN_UP(Request->FileName.Size);
+    Request->Req.Create.SecurityDescriptor.Offset = 0 != SecurityDescriptorSize ?
+        NEXTOFS(Request->FileName) : 0;
     Request->Req.Create.SecurityDescriptor.Size = (UINT16)SecurityDescriptorSize;
     Request->Req.Create.AllocationSize = AllocationSize;
     Request->Req.Create.AccessToken = 0;
     Request->Req.Create.DesiredAccess = DesiredAccess;
     Request->Req.Create.GrantedAccess = GrantedAccess;
     Request->Req.Create.ShareAccess = ShareAccess;
-    Request->Req.Create.Ea.Offset = 0;
-    Request->Req.Create.Ea.Size = 0;
+    Request->Req.Create.Ea.Offset = 0 != ExtraBuffer ?
+        (0 != Request->Req.Create.SecurityDescriptor.Offset ?
+            NEXTOFS(Request->Req.Create.SecurityDescriptor) : NEXTOFS(Request->FileName)) : 0;
+    Request->Req.Create.Ea.Size = 0 != ExtraBuffer ? (UINT16)ExtraLength : 0;
     Request->Req.Create.UserMode = UserMode == RequestorMode;
     Request->Req.Create.HasTraversePrivilege = HasTraversePrivilege;
     Request->Req.Create.HasBackupPrivilege = HasBackupPrivilege;
@@ -605,9 +682,10 @@ static NTSTATUS FspFsvolCreateNoLock(
     Request->Req.Create.CaseSensitive = CaseSensitive;
     Request->Req.Create.HasTrailingBackslash = HasTrailingBackslash;
     Request->Req.Create.NamedStream = MainFileName.Length;
-
     Request->Req.Create.AcceptsSecurityDescriptor = 0 == Request->Req.Create.NamedStream &&
         !!FsvolDeviceExtension->VolumeParams.AllowOpenInKernelMode;
+    Request->Req.Create.EaIsReparsePoint = EaIsReparsePoint;
+#undef NEXTOFS
 
     ASSERT(
         0 == StreamPart.Length && 0 == MainFileName.Length ||
@@ -617,6 +695,11 @@ static NTSTATUS FspFsvolCreateNoLock(
     if (0 != SecurityDescriptorSize)
         RtlCopyMemory(Request->Buffer + Request->Req.Create.SecurityDescriptor.Offset,
             SecurityDescriptor, SecurityDescriptorSize);
+
+    /* copy the extra buffer (if any) into the request */
+    if (0 != ExtraBuffer)
+        RtlCopyMemory(Request->Buffer + Request->Req.Create.Ea.Offset,
+            ExtraBuffer, ExtraLength);
 
     /* fix FileNode->FileName if we are doing SL_OPEN_TARGET_DIRECTORY */
     if (Request->Req.Create.OpenTargetDirectory)
@@ -1081,6 +1164,7 @@ NTSTATUS FspFsvolCreateComplete(
             }
 
             PVOID RequestDeviceObjectValue = FspIopRequestContext(Request, RequestDeviceObject);
+            FSP_FSCTL_TRANSACT_BUF Ea = Request->Req.Create.Ea;
 
             /* disassociate the FileDesc momentarily from the Request */
             FspIopRequestContext(Request, RequestDeviceObject) = 0;
@@ -1101,6 +1185,7 @@ NTSTATUS FspFsvolCreateComplete(
             Request->Req.Overwrite.FileAttributes = FileAttributes;
             Request->Req.Overwrite.AllocationSize = AllocationSize;
             Request->Req.Overwrite.Supersede = FILE_SUPERSEDED == Response->IoStatus.Information;
+            Request->Req.Overwrite.Ea = Ea;
 
             /*
              * Post it as BestEffort.
@@ -1141,8 +1226,16 @@ NTSTATUS FspFsvolCreateComplete(
         if (0 == FileNode->MainFileNode)
             FspFileNodeOverwriteStreams(FileNode);
         FspFileNodeSetFileInfo(FileNode, FileObject, &Response->Rsp.Overwrite.FileInfo, TRUE);
+        if (0 == FileNode->MainFileNode && FsvolDeviceExtension->VolumeParams.ExtendedAttributes)
+        {
+            /* invalidate any existing EA and increment the EA change count */
+            FspFileNodeSetEa(FileNode, 0, 0);
+            FileNode->EaChangeCount++;
+        }
         FspFileNodeNotifyChange(FileNode,
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
+                (0 == FileNode->MainFileNode && FsvolDeviceExtension->VolumeParams.ExtendedAttributes ?
+                    FILE_NOTIFY_CHANGE_EA : 0),
             FILE_ACTION_MODIFIED,
             FALSE);
 

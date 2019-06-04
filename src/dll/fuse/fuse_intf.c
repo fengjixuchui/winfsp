@@ -429,6 +429,15 @@ static NTSTATUS fsp_fuse_intf_GetFileInfoFunnel(FSP_FILE_SYSTEM *FileSystem,
     }
     if (StatEx)
         FileInfo->FileAttributes |= fsp_fuse_intf_MapFlagsToFileAttributes(stbuf.st_flags);
+    if (f->dothidden)
+    {
+        const char *basename = PosixPath;
+        for (const char *p = PosixPath; '\0' != *p; p++)
+            if ('/' == *p)
+                basename = p + 1;
+        if ('.' == basename[0])
+            FileInfo->FileAttributes |= FILE_ATTRIBUTE_HIDDEN;
+    }
     FileInfo->FileSize = stbuf.st_size;
     FileInfo->AllocationSize =
         (FileInfo->FileSize + AllocationUnit - 1) / AllocationUnit * AllocationUnit;
@@ -437,6 +446,9 @@ static NTSTATUS fsp_fuse_intf_GetFileInfoFunnel(FSP_FILE_SYSTEM *FileSystem,
     FspPosixUnixTimeToFileTime((void *)&stbuf.st_mtim, &FileInfo->LastWriteTime);
     FspPosixUnixTimeToFileTime((void *)&stbuf.st_ctim, &FileInfo->ChangeTime);
     FileInfo->IndexNumber = stbuf.st_ino;
+
+    FileInfo->HardLinks = 0;
+    FileInfo->EaSize = 0;
 
     return STATUS_SUCCESS;
 }
@@ -666,6 +678,9 @@ static NTSTATUS fsp_fuse_intf_GetReparsePointEx(FSP_FILE_SYSTEM *FileSystem,
 static NTSTATUS fsp_fuse_intf_GetReparsePointByName(
     FSP_FILE_SYSTEM *FileSystem, PVOID Context,
     PWSTR FileName, BOOLEAN IsDirectory, PVOID Buffer, PSIZE_T PSize);
+static NTSTATUS fsp_fuse_intf_SetEaEntry(
+    FSP_FILE_SYSTEM *FileSystem, PVOID Context,
+    PFILE_FULL_EA_INFORMATION SingleEa);
 
 static NTSTATUS fsp_fuse_intf_GetVolumeInfo(FSP_FILE_SYSTEM *FileSystem,
     FSP_FSCTL_VOLUME_INFO *VolumeInfo)
@@ -737,6 +752,7 @@ exit:
 static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
     PWSTR FileName, UINT32 CreateOptions, UINT32 GrantedAccess,
     UINT32 FileAttributes, PSECURITY_DESCRIPTOR SecurityDescriptor, UINT64 AllocationSize,
+    PVOID ExtraBuffer, ULONG ExtraLength, BOOLEAN ExtraBufferIsReparsePoint,
     PVOID *PFileDesc, FSP_FSCTL_FILE_INFO *FileInfo)
 {
     struct fuse *f = FileSystem->UserContext;
@@ -749,6 +765,25 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
     BOOLEAN Opened = FALSE;
     int err;
     NTSTATUS Result;
+
+    if (0 != ExtraBuffer)
+    {
+        if (!ExtraBufferIsReparsePoint)
+        {
+            if (0 == f->ops.listxattr || 0 == f->ops.getxattr ||
+                0 == f->ops.setxattr || 0 == f->ops.removexattr)
+            {
+                Result = STATUS_EAS_NOT_SUPPORTED;
+                goto exit;
+            }
+        }
+        else
+        {
+            /* !!!: revisit */
+            Result = STATUS_INVALID_PARAMETER;
+            goto exit;
+        }
+    }
 
     filedesc = MemAlloc(sizeof *filedesc);
     if (0 == filedesc)
@@ -768,8 +803,22 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
             goto exit;
     }
     Mode &= ~context->umask;
-    if (f->set_create_umask)
-        Mode = 0777 & ~f->create_umask;
+    if (CreateOptions & FILE_DIRECTORY_FILE)
+    {
+        if (f->set_create_dir_umask)
+            Mode = 0777 & ~f->create_dir_umask;
+        else
+        if (f->set_create_umask)
+            Mode = 0777 & ~f->create_umask;
+    }
+    else
+    {
+        if (f->set_create_file_umask)
+            Mode = 0777 & ~f->create_file_umask;
+        else
+        if (f->set_create_umask)
+            Mode = 0777 & ~f->create_umask;
+    }
 
     memset(&fi, 0, sizeof fi);
     if ('C' == f->env->environment) /* Cygwin */
@@ -849,6 +898,22 @@ static NTSTATUS fsp_fuse_intf_Create(FSP_FILE_SYSTEM *FileSystem,
             goto exit;
     }
 
+    if (0 != ExtraBuffer)
+    {
+        if (!ExtraBufferIsReparsePoint)
+        {
+            Result = FspFileSystemEnumerateEa(FileSystem,
+                fsp_fuse_intf_SetEaEntry, contexthdr->PosixPath, ExtraBuffer, ExtraLength);
+            if (!NT_SUCCESS(Result))
+                goto exit;
+        }
+        else
+        {
+            /* !!!: revisit: WslFeatures, GetFileInfoFunnel, GetReparsePointEx, SetReparsePoint */
+            Result = STATUS_INVALID_PARAMETER;
+            goto exit;
+        }
+    }
     /*
      * Ignore fuse_file_info::direct_io, fuse_file_info::keep_cache.
      * NOTE: Originally WinFsp dit not support disabling the cache manager
@@ -1001,6 +1066,7 @@ exit:
 
 static NTSTATUS fsp_fuse_intf_Overwrite(FSP_FILE_SYSTEM *FileSystem,
     PVOID FileDesc, UINT32 FileAttributes, BOOLEAN ReplaceFileAttributes, UINT64 AllocationSize,
+    PFILE_FULL_EA_INFORMATION Ea, ULONG EaLength,
     FSP_FSCTL_FILE_INFO *FileInfo)
 {
     struct fuse *f = FileSystem->UserContext;
@@ -1012,6 +1078,29 @@ static NTSTATUS fsp_fuse_intf_Overwrite(FSP_FILE_SYSTEM *FileSystem,
 
     if (filedesc->IsDirectory || filedesc->IsReparsePoint)
         return STATUS_ACCESS_DENIED;
+
+    if (0 != Ea)
+    {
+        char names[3 * 1024];
+        int namesize;
+
+        if (0 == f->ops.listxattr || 0 == f->ops.getxattr ||
+            0 == f->ops.setxattr || 0 == f->ops.removexattr)
+            return STATUS_EAS_NOT_SUPPORTED;
+
+        namesize = f->ops.listxattr(filedesc->PosixPath, names, sizeof names);
+        if (0 < namesize)
+            for (char *p = names, *endp = p + namesize; endp > p; p += namesize)
+            {
+                namesize = lstrlenA(p) + 1;
+                f->ops.removexattr(filedesc->PosixPath, p);
+            }
+
+        Result = FspFileSystemEnumerateEa(FileSystem,
+            fsp_fuse_intf_SetEaEntry, filedesc->PosixPath, Ea, EaLength);
+        if (!NT_SUCCESS(Result))
+            return Result;
+    }
 
     if (0 != f->ops.ftruncate)
     {
@@ -1664,7 +1753,7 @@ int fsp_fuse_intf_AddDirInfo(void *buf, const char *name,
         UINT32 Uid, Gid, Mode;
         NTSTATUS Result0;
 
-        Result0 = fsp_fuse_intf_GetFileInfoFunnel(dh->FileSystem, 0, 0, stbuf,
+        Result0 = fsp_fuse_intf_GetFileInfoFunnel(dh->FileSystem, name, 0, stbuf,
             &Uid, &Gid, &Mode, 0, &DirInfo->FileInfo);
         if (NT_SUCCESS(Result0))
             DirInfo->Padding[0] = 1; /* HACK: remember that the FileInfo is valid */
@@ -2173,14 +2262,113 @@ static NTSTATUS fsp_fuse_intf_Control(FSP_FILE_SYSTEM *FileSystem,
     return fsp_fuse_ntstatus_from_errno(f->env, err);
 }
 
+static NTSTATUS fsp_fuse_intf_GetEa(FSP_FILE_SYSTEM *FileSystem,
+    PVOID FileDesc,
+    PFILE_FULL_EA_INFORMATION Ea0, ULONG EaLength, PULONG PBytesTransferred)
+{
+    struct fuse *f = FileSystem->UserContext;
+    struct fsp_fuse_file_desc *filedesc = FileDesc;
+    char names[3 * 1024];
+    int namesize, valuesize;
+    PFILE_FULL_EA_INFORMATION Ea = Ea0, PrevEa = 0;
+    PUINT8 EaEnd = (PUINT8)Ea + EaLength, EaValue;
+
+    if (0 == f->ops.listxattr || 0 == f->ops.getxattr)
+        return STATUS_INVALID_DEVICE_REQUEST;
+
+    namesize = f->ops.listxattr(filedesc->PosixPath, names, sizeof names);
+    if (0 >= namesize)
+    {
+        *PBytesTransferred = 0;
+        return fsp_fuse_ntstatus_from_errno(f->env, namesize);
+    }
+
+    for (char *p = names, *endp = p + namesize; endp > p; p += namesize)
+    {
+        namesize = lstrlenA(p) + 1;
+
+        EaValue = (PUINT8)Ea + FIELD_OFFSET(FILE_FULL_EA_INFORMATION, EaName) + namesize;
+        if (EaValue >= EaEnd)
+            /* if there is no space (at least 1 byte) for a value bail out */
+            break;
+
+        valuesize = f->ops.getxattr(filedesc->PosixPath, p, EaValue, EaEnd - EaValue);
+        if (0 >= valuesize)
+            continue;
+
+        Ea->NextEntryOffset = 0;
+        Ea->Flags = 0;
+        Ea->EaNameLength = namesize - 1;
+        Ea->EaValueLength = valuesize;
+        memcpy(Ea->EaName, p, namesize);
+
+        if (0 != PrevEa)
+            PrevEa->NextEntryOffset = (ULONG)((PUINT8)Ea - (PUINT8)PrevEa);
+        PrevEa = Ea;
+
+        *PBytesTransferred = (ULONG)((PUINT8)EaValue - (PUINT8)Ea0 + valuesize);
+        Ea = (PVOID)((PUINT8)Ea +
+            FSP_FSCTL_ALIGN_UP(
+                FIELD_OFFSET(FILE_FULL_EA_INFORMATION, EaName) + namesize + valuesize,
+                sizeof(ULONG)));
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS fsp_fuse_intf_SetEaEntry(
+    FSP_FILE_SYSTEM *FileSystem, PVOID Context,
+    PFILE_FULL_EA_INFORMATION SingleEa)
+{
+    struct fuse *f = FileSystem->UserContext;
+    const char *PosixPath = Context;
+    int err;
+
+    if (0 != SingleEa->EaValueLength)
+        err = f->ops.setxattr(PosixPath,
+            SingleEa->EaName, SingleEa->EaName + SingleEa->EaNameLength + 1, SingleEa->EaValueLength, 0);
+    else
+        err = f->ops.removexattr(PosixPath,
+            SingleEa->EaName);
+
+    return fsp_fuse_ntstatus_from_errno(f->env, err);
+}
+
+static NTSTATUS fsp_fuse_intf_SetEa(FSP_FILE_SYSTEM *FileSystem,
+    PVOID FileDesc,
+    PFILE_FULL_EA_INFORMATION Ea, ULONG EaLength,
+    FSP_FSCTL_FILE_INFO *FileInfo)
+{
+    struct fuse *f = FileSystem->UserContext;
+    struct fsp_fuse_file_desc *filedesc = FileDesc;
+    UINT32 Uid, Gid, Mode;
+    struct fuse_file_info fi;
+    NTSTATUS Result;
+
+    if (0 == f->ops.setxattr || 0 == f->ops.removexattr)
+        return STATUS_INVALID_DEVICE_REQUEST;
+
+    Result = FspFileSystemEnumerateEa(FileSystem,
+        fsp_fuse_intf_SetEaEntry, filedesc->PosixPath, Ea, EaLength);
+    if (!NT_SUCCESS(Result))
+        return Result;
+
+    memset(&fi, 0, sizeof fi);
+    fi.flags = filedesc->OpenFlags;
+    fi.fh = filedesc->FileHandle;
+
+    return fsp_fuse_intf_GetFileInfoEx(FileSystem, filedesc->PosixPath, &fi,
+        &Uid, &Gid, &Mode, FileInfo);
+}
+
 FSP_FILE_SYSTEM_INTERFACE fsp_fuse_intf =
 {
     fsp_fuse_intf_GetVolumeInfo,
     fsp_fuse_intf_SetVolumeLabel,
     fsp_fuse_intf_GetSecurityByName,
-    fsp_fuse_intf_Create,
+    0,
     fsp_fuse_intf_Open,
-    fsp_fuse_intf_Overwrite,
+    0,
     fsp_fuse_intf_Cleanup,
     fsp_fuse_intf_Close,
     fsp_fuse_intf_Read,
@@ -2201,6 +2389,11 @@ FSP_FILE_SYSTEM_INTERFACE fsp_fuse_intf =
     0,
     fsp_fuse_intf_GetDirInfoByName,
     fsp_fuse_intf_Control,
+    0,
+    fsp_fuse_intf_Create,
+    fsp_fuse_intf_Overwrite,
+    fsp_fuse_intf_GetEa,
+    fsp_fuse_intf_SetEa,
 };
 
 /*

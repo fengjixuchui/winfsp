@@ -31,7 +31,8 @@ static NTSTATUS FspFsvolQueryBasicInformation(PFILE_OBJECT FileObject,
     PVOID *PBuffer, PVOID BufferEnd,
     const FSP_FSCTL_FILE_INFO *FileInfo);
 static NTSTATUS FspFsvolQueryEaInformation(PFILE_OBJECT FileObject,
-    PVOID *PBuffer, PVOID BufferEnd);
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo);
 static NTSTATUS FspFsvolQueryInternalInformation(PFILE_OBJECT FileObject,
     PVOID *PBuffer, PVOID BufferEnd);
 static NTSTATUS FspFsvolQueryNameInformation(PFILE_OBJECT FileObject,
@@ -44,6 +45,15 @@ static NTSTATUS FspFsvolQueryPositionInformation(PFILE_OBJECT FileObject,
 static NTSTATUS FspFsvolQueryStandardInformation(PFILE_OBJECT FileObject,
     PVOID *PBuffer, PVOID BufferEnd,
     const FSP_FSCTL_FILE_INFO *FileInfo);
+static NTSTATUS FspFsvolQueryStatBaseInformation(PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo);
+static NTSTATUS FspFsvolQueryStatLxBaseInformation(PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo);
+static NTSTATUS FspFsvolQueryStatLxEaInformation(
+    PDEVICE_OBJECT FsvolDeviceObject, PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd);
 static NTSTATUS FspFsvolQueryStreamInformationCopy(
     FSP_FSCTL_STREAM_INFO *StreamInfoBuffer, ULONG StreamInfoBufferSize,
     PVOID DestBuf, PULONG PDestLen);
@@ -51,6 +61,9 @@ static NTSTATUS FspFsvolQueryStreamInformation(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 static NTSTATUS FspFsvolQueryStreamInformationSuccess(
     PIRP Irp, const FSP_FSCTL_TRANSACT_RSP *Response);
+static NTSTATUS FspFsvolQueryInformationEffectiveAccess(
+    PDEVICE_OBJECT FsvolDeviceObject, PFILE_OBJECT FileObject,
+    PACCESS_MASK PEffectiveAccess);
 static NTSTATUS FspFsvolQueryInformation(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 FSP_IOCMPL_DISPATCH FspFsvolQueryInformationComplete;
@@ -96,9 +109,13 @@ FAST_IO_QUERY_OPEN FspFastIoQueryOpen;
 #pragma alloc_text(PAGE, FspFsvolQueryNetworkOpenInformation)
 #pragma alloc_text(PAGE, FspFsvolQueryPositionInformation)
 #pragma alloc_text(PAGE, FspFsvolQueryStandardInformation)
+#pragma alloc_text(PAGE, FspFsvolQueryStatBaseInformation)
+#pragma alloc_text(PAGE, FspFsvolQueryStatLxBaseInformation)
+#pragma alloc_text(PAGE, FspFsvolQueryStatLxEaInformation)
 #pragma alloc_text(PAGE, FspFsvolQueryStreamInformationCopy)
 #pragma alloc_text(PAGE, FspFsvolQueryStreamInformation)
 #pragma alloc_text(PAGE, FspFsvolQueryStreamInformationSuccess)
+#pragma alloc_text(PAGE, FspFsvolQueryInformationEffectiveAccess)
 #pragma alloc_text(PAGE, FspFsvolQueryInformation)
 #pragma alloc_text(PAGE, FspFsvolQueryInformationComplete)
 #pragma alloc_text(PAGE, FspFsvolQueryInformationRequestFini)
@@ -175,7 +192,12 @@ static NTSTATUS FspFsvolQueryAllInformation(PFILE_OBJECT FileObject,
 
     Info->InternalInformation.IndexNumber.QuadPart = FileNode->IndexNumber;
 
-    Info->EaInformation.EaSize = 0;
+    Info->EaInformation.EaSize =
+        FspFsvolDeviceExtension(FileNode->FsvolDeviceObject)->VolumeParams.ExtendedAttributes ?
+            FileInfo->EaSize : 0;
+    /* magic computations are courtesy of NTFS */
+    if (0 != Info->EaInformation.EaSize)
+        Info->EaInformation.EaSize += 4;
 
     Info->PositionInformation.CurrentByteOffset = FileObject->CurrentByteOffset;
 
@@ -236,20 +258,28 @@ static NTSTATUS FspFsvolQueryBasicInformation(PFILE_OBJECT FileObject,
 }
 
 static NTSTATUS FspFsvolQueryEaInformation(PFILE_OBJECT FileObject,
-    PVOID *PBuffer, PVOID BufferEnd)
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo)
 {
     PAGED_CODE();
 
     PFILE_EA_INFORMATION Info = (PFILE_EA_INFORMATION)*PBuffer;
 
-    if ((PVOID)(Info + 1) > BufferEnd)
-        return STATUS_BUFFER_TOO_SMALL;
+    if (0 == FileInfo)
+    {
+        if ((PVOID)(Info + 1) > BufferEnd)
+            return STATUS_BUFFER_TOO_SMALL;
 
-    /*
-     * No EA support currently. We must nevertheless respond to this query
-     * or SRV2 gets unhappy. Just tell them that we have 0 EA's.
-     */
-    Info->EaSize = 0;
+        return STATUS_SUCCESS;
+    }
+
+    FSP_FILE_NODE *FileNode = FileObject->FsContext;
+    Info->EaSize =
+        FspFsvolDeviceExtension(FileNode->FsvolDeviceObject)->VolumeParams.ExtendedAttributes ?
+            FileInfo->EaSize : 0;
+    /* magic computations are courtesy of NTFS */
+    if (0 != Info->EaSize)
+        Info->EaSize += 4;
 
     *PBuffer = (PVOID)(Info + 1);
 
@@ -287,7 +317,7 @@ static NTSTATUS FspFsvolQueryNameInformation(PFILE_OBJECT FileObject,
     PDEVICE_OBJECT FsvolDeviceObject = FileNode->FsvolDeviceObject;
     FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
 
-    if ((PVOID)(Info + 1) > BufferEnd)
+    if ((PVOID)((PUINT8)Info + FIELD_OFFSET(FILE_NAME_INFORMATION, FileName)) > BufferEnd)
         return STATUS_BUFFER_TOO_SMALL;
 
     FspFileNodeAcquireShared(FileNode, Main);
@@ -401,6 +431,187 @@ static NTSTATUS FspFsvolQueryStandardInformation(PFILE_OBJECT FileObject,
     *PBuffer = (PVOID)(Info + 1);
 
     return STATUS_SUCCESS;
+}
+
+static NTSTATUS FspFsvolQueryStatBaseInformation(PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo)
+{
+    PAGED_CODE();
+
+    PFSP_FILE_STAT_INFORMATION Info = (PFSP_FILE_STAT_INFORMATION)*PBuffer;
+    FSP_FILE_NODE *FileNode = FileObject->FsContext;
+
+    if (0 == FileInfo)
+    {
+        if ((PVOID)(Info + 1) > BufferEnd)
+            return STATUS_BUFFER_TOO_SMALL;
+
+        return STATUS_SUCCESS;
+    }
+
+    Info->FileId.QuadPart = FileNode->IndexNumber;
+    Info->CreationTime.QuadPart = FileInfo->CreationTime;
+    Info->LastAccessTime.QuadPart = FileInfo->LastAccessTime;
+    Info->LastWriteTime.QuadPart = FileInfo->LastWriteTime;
+    Info->ChangeTime.QuadPart = FileInfo->ChangeTime;
+    Info->AllocationSize.QuadPart = FileInfo->AllocationSize;
+    Info->EndOfFile.QuadPart = FileInfo->FileSize;
+    Info->FileAttributes = 0 != FileInfo->FileAttributes ?
+        FileInfo->FileAttributes : FILE_ATTRIBUTE_NORMAL;
+    Info->ReparseTag = FileInfo->ReparseTag;
+    Info->NumberOfLinks = 1;
+
+    *PBuffer = (PVOID)(Info + 1);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS FspFsvolQueryStatLxBaseInformation(PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd,
+    const FSP_FSCTL_FILE_INFO *FileInfo)
+{
+    PAGED_CODE();
+
+    PFSP_FILE_STAT_LX_INFORMATION Info = (PFSP_FILE_STAT_LX_INFORMATION)*PBuffer;
+    FSP_FILE_NODE *FileNode = FileObject->FsContext;
+
+    if (0 == FileInfo)
+    {
+        if ((PVOID)(Info + 1) > BufferEnd)
+            return STATUS_BUFFER_TOO_SMALL;
+
+        return STATUS_SUCCESS;
+    }
+
+    Info->FileId.QuadPart = FileNode->IndexNumber;
+    Info->CreationTime.QuadPart = FileInfo->CreationTime;
+    Info->LastAccessTime.QuadPart = FileInfo->LastAccessTime;
+    Info->LastWriteTime.QuadPart = FileInfo->LastWriteTime;
+    Info->ChangeTime.QuadPart = FileInfo->ChangeTime;
+    Info->AllocationSize.QuadPart = FileInfo->AllocationSize;
+    Info->EndOfFile.QuadPart = FileInfo->FileSize;
+    Info->FileAttributes = 0 != FileInfo->FileAttributes ?
+        FileInfo->FileAttributes : FILE_ATTRIBUTE_NORMAL;
+    Info->ReparseTag = FileInfo->ReparseTag;
+    Info->NumberOfLinks = 1;
+
+    *PBuffer = (PVOID)(Info + 1);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS FspFsvolQueryStatLxEaInformation(
+    PDEVICE_OBJECT FsvolDeviceObject, PFILE_OBJECT FileObject,
+    PVOID *PBuffer, PVOID BufferEnd)
+{
+#define ADD_GET_EA(Name, End)           \
+    GetEa->NextEntryOffset = (ULONG)(End ? 0 :\
+        FSP_FSCTL_ALIGN_UP(             \
+            FIELD_OFFSET(FILE_GET_EA_INFORMATION, EaName) + sizeof("" Name),\
+            sizeof(ULONG)));            \
+    GetEa->EaNameLength = (UCHAR)(sizeof("" Name) - 1);\
+    RtlCopyMemory(GetEa->EaName, "" Name, sizeof("" Name));\
+    GetEaLength = (ULONG)((PUINT8)GetEa - (PUINT8)&GetEaBuf.V +\
+        FIELD_OFFSET(FILE_GET_EA_INFORMATION, EaName) + sizeof("" Name));\
+    GetEa = (PVOID)((PUINT8)GetEa + GetEa->NextEntryOffset);
+#define EQUAL_EA_NAME(Name)             \
+    CmpName.Length =                    \
+    CmpName.MaximumLength = sizeof("" Name) - 1,\
+    CmpName.Buffer = "" Name,           \
+    RtlEqualString(&CmpName, &EaName, TRUE/* always case-insensitive */)
+
+    PAGED_CODE();
+
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    PFSP_FILE_STAT_LX_INFORMATION Info = (PFSP_FILE_STAT_LX_INFORMATION)*PBuffer;
+    union
+    {
+        FILE_GET_EA_INFORMATION V;
+        UINT8 B[64];
+    } GetEaBuf;
+    PFILE_GET_EA_INFORMATION GetEa = &GetEaBuf.V;
+    ULONG GetEaLength = 0;
+    union
+    {
+        FILE_FULL_EA_INFORMATION V;
+        UINT8 B[128];
+    } EaBuf;
+    ULONG EaLength = sizeof EaBuf;
+    STRING EaName, CmpName;
+    NTSTATUS Result;
+
+    Info->LxFlags = 0;
+    Info->LxUid = 0;
+    Info->LxGid = 0;
+    Info->LxMode = 0;
+    Info->LxDeviceIdMajor = 0;
+    Info->LxDeviceIdMinor = 0;
+
+    if (!FsvolDeviceExtension->VolumeParams.ExtendedAttributes)
+        return STATUS_SUCCESS;
+
+    ADD_GET_EA("$LXUID", 0);
+    ADD_GET_EA("$LXGID", 0);
+    ADD_GET_EA("$LXMOD", 0);
+    ADD_GET_EA("$LXDEV", 1);
+
+    Result = FspSendQueryEaIrp(FsvolDeviceObject/* bypass filters */, FileObject,
+        &GetEaBuf.V, GetEaLength,
+        &EaBuf.V, &EaLength);
+    if (!NT_SUCCESS(Result))
+        return Result;
+
+    for (PFILE_FULL_EA_INFORMATION Ea = &EaBuf.V, EaEnd = (PVOID)((PUINT8)Ea + EaLength);
+        EaEnd > Ea; Ea = FSP_NEXT_EA(Ea, EaEnd))
+    {
+        EaName.Length =
+        EaName.MaximumLength = Ea->EaNameLength,
+        EaName.Buffer = Ea->EaName;
+
+        if (EQUAL_EA_NAME("$LXUID"))
+        {
+            if (sizeof(ULONG) == Ea->EaValueLength)
+            {
+                Info->LxFlags |= 0x1/*LX_FILE_METADATA_HAS_UID*/;
+                Info->LxUid = *(PULONG)(Ea->EaName + sizeof "$LXUID");
+            }
+        }
+        else
+        if (EQUAL_EA_NAME("$LXGID"))
+        {
+            if (sizeof(ULONG) == Ea->EaValueLength)
+            {
+                Info->LxFlags |= 0x2/*LX_FILE_METADATA_HAS_GID*/;
+                Info->LxGid = *(PULONG)(Ea->EaName + sizeof "$LXGID");
+            }
+        }
+        else
+        if (EQUAL_EA_NAME("$LXMOD"))
+        {
+            if (sizeof(ULONG) == Ea->EaValueLength)
+            {
+                Info->LxFlags |= 0x4/*LX_FILE_METADATA_HAS_MODE*/;
+                Info->LxMode = *(PULONG)(Ea->EaName + sizeof "$LXMOD");
+            }
+        }
+        else
+        if (EQUAL_EA_NAME("$LXDEV"))
+        {
+            if (sizeof(UINT64) == Ea->EaValueLength)
+            {
+                Info->LxFlags |= 0x8/*LX_FILE_METADATA_HAS_DEVICE_ID*/;
+                UINT64 Dev = *(PUINT64)(Ea->EaName + sizeof "$LXDEV");
+                Info->LxDeviceIdMajor = (Dev >> 32) & 0xffffffff;
+                Info->LxDeviceIdMinor = Dev & 0xffffffff;
+            }
+        }
+    }
+
+    return STATUS_SUCCESS;
+
+#undef EQUAL_EA_NAME
+#undef ADD_GET_EA
 }
 
 static NTSTATUS FspFsvolQueryStreamInformationCopy(
@@ -632,6 +843,69 @@ static NTSTATUS FspFsvolQueryStreamInformationSuccess(
     return Result;
 }
 
+static NTSTATUS FspFsvolQueryInformationEffectiveAccess(
+    PDEVICE_OBJECT FsvolDeviceObject, PFILE_OBJECT FileObject,
+    PACCESS_MASK PEffectiveAccess)
+{
+    union
+    {
+        SECURITY_DESCRIPTOR V;
+        UINT8 B[256];
+    } SecurityDescriptorBuf;
+    PSECURITY_DESCRIPTOR SecurityDescriptor = &SecurityDescriptorBuf.V;
+    ULONG Length;
+    SECURITY_SUBJECT_CONTEXT SecuritySubjectContext;
+    ACCESS_MASK EffectiveAccess;
+    NTSTATUS Result;
+    BOOLEAN AccessResult;
+
+    *PEffectiveAccess = 0;
+
+    Length = sizeof SecurityDescriptorBuf;
+    Result = FspSendQuerySecurityIrp(FsvolDeviceObject/* bypass filters */, FileObject,
+        OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        SecurityDescriptor, &Length);
+    if (STATUS_BUFFER_OVERFLOW == Result)
+    {
+        SecurityDescriptor = FspAlloc(Length);
+        if (0 == SecurityDescriptor)
+        {
+            Result = STATUS_INSUFFICIENT_RESOURCES;
+            goto exit;
+        }
+
+        Result = FspSendQuerySecurityIrp(FsvolDeviceObject/* bypass filters */, FileObject,
+            OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            SecurityDescriptor, &Length);
+    }
+    if (!NT_SUCCESS(Result))
+        goto exit;
+
+    SeCaptureSubjectContext(&SecuritySubjectContext);
+
+    AccessResult = SeAccessCheck(
+        SecurityDescriptor,
+        &SecuritySubjectContext,
+        FALSE,
+        MAXIMUM_ALLOWED,
+        0,
+        0,
+        IoGetFileObjectGenericMapping(),
+        UserMode,
+        &EffectiveAccess,
+        &Result);
+    if (!AccessResult)
+        goto exit;
+
+    *PEffectiveAccess = EffectiveAccess;
+
+exit:
+    if (&SecurityDescriptorBuf.V != SecurityDescriptor && 0 != SecurityDescriptor)
+        FspFree(SecurityDescriptor);
+
+    return Result;
+}
+
 static NTSTATUS FspFsvolQueryInformation(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
 {
@@ -679,9 +953,8 @@ static NTSTATUS FspFsvolQueryInformation(
         Result = STATUS_INVALID_PARAMETER;  /* no compression support */
         return Result;
     case FileEaInformation:
-        Result = FspFsvolQueryEaInformation(FileObject, &Buffer, BufferEnd);
-        Irp->IoStatus.Information = (UINT_PTR)((PUINT8)Buffer - (PUINT8)Irp->AssociatedIrp.SystemBuffer);
-        return Result;
+        Result = FspFsvolQueryEaInformation(FileObject, &Buffer, BufferEnd, 0);
+        break;
     case FileHardLinkInformation:
         Result = STATUS_NOT_SUPPORTED;  /* no hard link support */
         return Result;
@@ -707,6 +980,18 @@ static NTSTATUS FspFsvolQueryInformation(
     case FileStandardInformation:
         Result = FspFsvolQueryStandardInformation(FileObject, &Buffer, BufferEnd, 0);
         break;
+    case 68/*FileStatInformation*/:
+        if (FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.WslFeatures)
+            Result = FspFsvolQueryStatBaseInformation(FileObject, &Buffer, BufferEnd, 0);
+        else
+            Result = STATUS_INVALID_PARAMETER;
+        break;
+    case 70/*FileStatLxInformation*/:
+        if (FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.WslFeatures)
+            Result = FspFsvolQueryStatLxBaseInformation(FileObject, &Buffer, BufferEnd, 0);
+        else
+            Result = STATUS_INVALID_PARAMETER;
+        break;
     default:
         Result = STATUS_INVALID_PARAMETER;
         return Result;
@@ -716,6 +1001,26 @@ static NTSTATUS FspFsvolQueryInformation(
         return Result;
 
     FspFileNodeAcquireShared(FileNode, Main);
+
+    switch (FileInformationClass)
+    {
+    case 68/*FileStatInformation*/:
+        FspFsvolQueryInformationEffectiveAccess(
+            FsvolDeviceObject, FileObject, &((FSP_FILE_STAT_INFORMATION *)Buffer)->EffectiveAccess);
+        break;
+    case 70/*FileStatLxInformation*/:
+        FspFsvolQueryInformationEffectiveAccess(
+            FsvolDeviceObject, FileObject, &((FSP_FILE_STAT_LX_INFORMATION *)Buffer)->EffectiveAccess);
+        Result = FspFsvolQueryStatLxEaInformation(
+            FsvolDeviceObject, FileObject, &Buffer, BufferEnd);
+        if (!NT_SUCCESS(Result))
+        {
+            FspFileNodeRelease(FileNode, Main);
+            return Result;
+        }
+        break;
+    }
+
     if (FspFileNodeTryGetFileInfo(FileNode, &FileInfoBuf))
     {
         FspFileNodeRelease(FileNode, Main);
@@ -733,11 +1038,20 @@ static NTSTATUS FspFsvolQueryInformation(
         case FileBasicInformation:
             Result = FspFsvolQueryBasicInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
             break;
+        case FileEaInformation:
+            Result = FspFsvolQueryEaInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
+            break;
         case FileNetworkOpenInformation:
             Result = FspFsvolQueryNetworkOpenInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
             break;
         case FileStandardInformation:
             Result = FspFsvolQueryStandardInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
+            break;
+        case 68/*FileStatInformation*/:
+            Result = FspFsvolQueryStatBaseInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
+            break;
+        case 70/*FileStatLxInformation*/:
+            Result = FspFsvolQueryStatLxBaseInformation(FileObject, &Buffer, BufferEnd, &FileInfoBuf);
             break;
         default:
             ASSERT(0);
@@ -840,11 +1154,20 @@ NTSTATUS FspFsvolQueryInformationComplete(
     case FileBasicInformation:
         Result = FspFsvolQueryBasicInformation(FileObject, &Buffer, BufferEnd, FileInfo);
         break;
+    case FileEaInformation:
+        Result = FspFsvolQueryEaInformation(FileObject, &Buffer, BufferEnd, FileInfo);
+        break;
     case FileNetworkOpenInformation:
         Result = FspFsvolQueryNetworkOpenInformation(FileObject, &Buffer, BufferEnd, FileInfo);
         break;
     case FileStandardInformation:
         Result = FspFsvolQueryStandardInformation(FileObject, &Buffer, BufferEnd, FileInfo);
+        break;
+    case 68/*FileStatInformation*/:
+        Result = FspFsvolQueryStatBaseInformation(FileObject, &Buffer, BufferEnd, FileInfo);
+        break;
+    case 70/*FileStatLxInformation*/:
+        Result = FspFsvolQueryStatLxBaseInformation(FileObject, &Buffer, BufferEnd, FileInfo);
         break;
     default:
         ASSERT(0);
