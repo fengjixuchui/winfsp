@@ -325,6 +325,22 @@ static NTSTATUS FspFsvolDeviceInit(PDEVICE_OBJECT DeviceObject)
      * to track what has been initialized!
      */
 
+    /* initialize any fsext provider */
+    if (0 != FsvolDeviceExtension->VolumeParams.FsextControlCode)
+    {
+        FSP_FSEXT_PROVIDER *Provider = FspFsextProvider(
+            FsvolDeviceExtension->VolumeParams.FsextControlCode, 0);
+        if (0 != Provider)
+        {
+            Result = Provider->DeviceInit(DeviceObject, &FsvolDeviceExtension->VolumeParams);
+            if (!NT_SUCCESS(Result))
+                return Result;
+            FsvolDeviceExtension->InitDoneFsext = 1;
+        }
+        else
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+
     /* is there a virtual disk? */
     if (0 != FsvolDeviceExtension->FsvrtDeviceObject)
     {
@@ -500,6 +516,15 @@ static VOID FspFsvolDeviceFini(PDEVICE_OBJECT DeviceObject)
         if (0 != FsvolDeviceExtension->SwapVpb)
             FspFreeExternal(FsvolDeviceExtension->SwapVpb);
     }
+
+    /* finalize any fsext provider */
+    if (FsvolDeviceExtension->InitDoneFsext)
+    {
+        FSP_FSEXT_PROVIDER *Provider = FspFsextProvider(
+            FsvolDeviceExtension->VolumeParams.FsextControlCode, 0);
+        if (0 != Provider)
+            Provider->DeviceFini(DeviceObject);
+    }
 }
 
 static VOID FspFsvolDeviceTimerRoutine(PDEVICE_OBJECT DeviceObject, PVOID Context)
@@ -546,6 +571,14 @@ static VOID FspFsvolDeviceExpirationRoutine(PVOID Context)
     FspMetaCacheInvalidateExpired(FsvolDeviceExtension->SecurityCache, InterruptTime);
     FspMetaCacheInvalidateExpired(FsvolDeviceExtension->DirInfoCache, InterruptTime);
     FspMetaCacheInvalidateExpired(FsvolDeviceExtension->StreamInfoCache, InterruptTime);
+    /* run any fsext provider expiration routine */
+    if (0 != FsvolDeviceExtension->VolumeParams.FsextControlCode)
+    {
+        FSP_FSEXT_PROVIDER *Provider = FspFsextProvider(
+            FsvolDeviceExtension->VolumeParams.FsextControlCode, 0);
+        if (0 != Provider)
+            Provider->DeviceExpirationRoutine(DeviceObject, InterruptTime);
+    }
     FspIoqRemoveExpired(FsvolDeviceExtension->Ioq, InterruptTime);
 
     KeAcquireSpinLock(&FsvolDeviceExtension->ExpirationLock, &Irql);

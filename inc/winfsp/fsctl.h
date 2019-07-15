@@ -65,6 +65,10 @@ extern const __declspec(selectany) GUID FspFsvrtDeviceClassGuid =
 #define FSP_FSCTL_STOP                  \
     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'S', METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* fsctl internal device codes (usable only in-kernel) */
+#define FSP_FSCTL_TRANSACT_INTERNAL     \
+    CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'I', METHOD_NEITHER, FILE_ANY_ACCESS)
+
 #define FSP_FSCTL_VOLUME_PARAMS_PREFIX  "\\VolumeParams="
 
 #define FSP_FSCTL_VOLUME_NAME_SIZE      (64 * sizeof(WCHAR))
@@ -83,7 +87,7 @@ FSP_FSCTL_STATIC_ASSERT(FSP_FSCTL_VOLUME_NAME_SIZEMAX <= 260 * sizeof(WCHAR),
 #define FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN (64 * 1024)
 #define FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN       FSP_FSCTL_TRANSACT_REQ_SIZEMAX
 
-#define FSP_FSCTL_TRANSACT_REQ_TOKEN_HANDLE(T)  ((HANDLE)((T) & 0xffffffff))
+#define FSP_FSCTL_TRANSACT_REQ_TOKEN_HANDLE(T)  ((HANDLE)((UINT_PTR)((T) & 0xffffffff)))
 #define FSP_FSCTL_TRANSACT_REQ_TOKEN_PID(T)     ((UINT32)(((T) >> 32) & 0xffffffff))
 
 #define FSP_FSCTL_DEVICECONTROL_SIZEMAX (4 * 1024)  /* must be < FSP_FSCTL_TRANSACT_{REQ,RSP}_SIZEMAX */
@@ -121,7 +125,7 @@ enum
 {
     FspFsctlTransactTimeoutMinimum = 1000,
     FspFsctlTransactTimeoutMaximum = 10000,
-    FspFsctlTransactTimeoutDefault = 1000,
+    FspFsctlTransactTimeoutDefault = 1000,  /* DEPRECATED: default is unspecified */
     FspFsctlIrpTimeoutMinimum = 60000,
     FspFsctlIrpTimeoutMaximum = 600000,
     FspFsctlIrpTimeoutDefault = 300000,
@@ -139,7 +143,7 @@ enum
     UINT64 VolumeCreationTime;\
     UINT32 VolumeSerialNumber;\
     /* I/O timeouts, capacity, etc. */\
-    UINT32 TransactTimeout;             /* FSP_FSCTL_TRANSACT timeout (millis; 1 sec - 10 sec) */\
+    UINT32 TransactTimeout;             /* DEPRECATED: (millis; 1 sec - 10 sec) */\
     UINT32 IrpTimeout;                  /* pending IRP timeout (millis; 1 min - 10 min) */\
     UINT32 IrpCapacity;                 /* maximum number of pending IRP's (100 - 1000)*/\
     UINT32 FileInfoTimeout;             /* FileInfo/Security/VolumeInfo timeout (millis) */\
@@ -185,7 +189,8 @@ enum
     UINT32 SecurityTimeout;             /* security info timeout (millis); overrides FileInfoTimeout */\
     UINT32 StreamInfoTimeout;           /* stream info timeout (millis); overrides FileInfoTimeout */\
     UINT32 EaTimeout;                   /* EA timeout (millis); overrides FileInfoTimeout */\
-    UINT32 Reserved32[2];\
+    UINT32 FsextControlCode;\
+    UINT32 Reserved32[1];\
     UINT64 Reserved64[2];
 typedef struct
 {
@@ -588,7 +593,7 @@ static inline FSP_FSCTL_TRANSACT_RSP *FspFsctlTransactConsumeResponse(
     return NextResponse <= ResponseBufEnd ? (FSP_FSCTL_TRANSACT_RSP *)NextResponse : 0;
 }
 
-#if !defined(WINFSP_SYS_INTERNAL)
+#if !defined(_KERNEL_MODE)
 FSP_API NTSTATUS FspFsctlCreateVolume(PWSTR DevicePath,
     const FSP_FSCTL_VOLUME_PARAMS *VolumeParams,
     PWCHAR VolumeNameBuf, SIZE_T VolumeNameSize,

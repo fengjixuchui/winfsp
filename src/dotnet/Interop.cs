@@ -57,6 +57,12 @@ namespace Fsp.Interop
         internal const int PrefixSize = 192;
         internal const int FileSystemNameSize = 16;
 
+        internal const UInt32 VolumeInfoTimeoutValid = 0x00000001;
+        internal const UInt32 DirInfoTimeoutValid = 0x00000002;
+        internal const UInt32 SecurityTimeoutValid = 0x00000004;
+        internal const UInt32 StreamInfoTimeoutValid = 0x00000008;
+        internal const UInt32 EaTimeoutValid = 0x00000010;
+
         internal UInt16 Version;
         internal UInt16 SectorSize;
         internal UInt16 SectorsPerAllocationUnit;
@@ -70,6 +76,15 @@ namespace Fsp.Interop
         internal UInt32 Flags;
         internal unsafe fixed UInt16 Prefix[PrefixSize];
         internal unsafe fixed UInt16 FileSystemName[FileSystemNameSize];
+        internal UInt32 AdditionalFlags;
+        internal UInt32 VolumeInfoTimeout;
+        internal UInt32 DirInfoTimeout;
+        internal UInt32 SecurityTimeout;
+        internal UInt32 StreamInfoTimeout;
+        internal UInt32 EaTimeout;
+        internal UInt32 FsextControlCode;
+        internal unsafe fixed UInt32 Reserved32[1];
+        internal unsafe fixed UInt64 Reserved64[2];
 
         internal unsafe String GetPrefix()
         {
@@ -353,6 +368,65 @@ namespace Fsp.Interop
     {
         public IntPtr Status;
         public IntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct IoStatus
+    {
+        internal UInt32 Information;
+        internal UInt32 Status;
+    }
+
+    internal enum FspFsctlTransact
+    {
+        ReadKind = 5,
+        WriteKind = 6,
+        QueryDirectoryKind = 14
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct FspFsctlTransactReq
+    {
+        [FieldOffset(0)]
+        internal UInt16 Version;
+        [FieldOffset(2)]
+        internal UInt16 Size;
+        [FieldOffset(4)]
+        internal UInt32 Kind;
+        [FieldOffset(8)]
+        internal UInt64 Hint;
+
+        [FieldOffset(0)]
+        internal unsafe fixed Byte Padding[88];
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    internal struct FspFsctlTransactRsp
+    {
+        [FieldOffset(0)]
+        internal UInt16 Version;
+        [FieldOffset(2)]
+        internal UInt16 Size;
+        [FieldOffset(4)]
+        internal UInt32 Kind;
+        [FieldOffset(8)]
+        internal UInt64 Hint;
+
+        [FieldOffset(16)]
+        internal IoStatus IoStatus;
+
+        [FieldOffset(24)]
+        internal FileInfo WriteFileInfo;
+
+        [FieldOffset(0)]
+        internal unsafe fixed Byte Padding[128];
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct FspFileSystemOperationContext
+    {
+        internal FspFsctlTransactReq *Request;
+        internal FspFsctlTransactRsp *Response;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -664,6 +738,12 @@ namespace Fsp.Interop
             internal delegate Int32 FspFileSystemStopDispatcher(
                 IntPtr FileSystem);
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            internal delegate void FspFileSystemSendResponse(
+                IntPtr FileSystem,
+                ref FspFsctlTransactRsp Response);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            internal unsafe delegate FspFileSystemOperationContext *FspFileSystemGetOperationContext();
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             internal delegate IntPtr FspFileSystemMountPointF(
                 IntPtr FileSystem);
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -848,6 +928,8 @@ namespace Fsp.Interop
         internal static Proto.FspFileSystemRemoveMountPoint FspFileSystemRemoveMountPoint;
         internal static Proto.FspFileSystemStartDispatcher FspFileSystemStartDispatcher;
         internal static Proto.FspFileSystemStopDispatcher FspFileSystemStopDispatcher;
+        internal static Proto.FspFileSystemSendResponse FspFileSystemSendResponse;
+        internal static Proto.FspFileSystemGetOperationContext FspFileSystemGetOperationContext;
         internal static Proto.FspFileSystemMountPointF FspFileSystemMountPoint;
         internal static Proto.FspFileSystemSetOperationGuardStrategyF FspFileSystemSetOperationGuardStrategy;
         internal static Proto.FspFileSystemSetDebugLogF FspFileSystemSetDebugLog;
@@ -893,6 +975,10 @@ namespace Fsp.Interop
             }
             else
                 return _FspFileSystemSetMountPointEx(FileSystem, MountPoint, IntPtr.Zero);
+        }
+        internal static unsafe UInt64 FspFileSystemGetOperationRequestHint()
+        {
+            return FspFileSystemGetOperationContext()->Request->Hint;
         }
         internal static unsafe Boolean FspFileSystemAddDirInfo(
             ref DirInfo DirInfo,
@@ -1242,6 +1328,8 @@ namespace Fsp.Interop
             FspFileSystemRemoveMountPoint = GetEntryPoint<Proto.FspFileSystemRemoveMountPoint>(Module);
             FspFileSystemStartDispatcher = GetEntryPoint<Proto.FspFileSystemStartDispatcher>(Module);
             FspFileSystemStopDispatcher = GetEntryPoint<Proto.FspFileSystemStopDispatcher>(Module);
+            FspFileSystemSendResponse = GetEntryPoint<Proto.FspFileSystemSendResponse>(Module);
+            FspFileSystemGetOperationContext = GetEntryPoint<Proto.FspFileSystemGetOperationContext>(Module);
             FspFileSystemMountPoint = GetEntryPoint<Proto.FspFileSystemMountPointF>(Module);
             FspFileSystemSetOperationGuardStrategy = GetEntryPoint<Proto.FspFileSystemSetOperationGuardStrategyF>(Module);
             FspFileSystemSetDebugLog = GetEntryPoint<Proto.FspFileSystemSetDebugLogF>(Module);

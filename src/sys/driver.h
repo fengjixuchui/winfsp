@@ -29,12 +29,19 @@
 #include <ntstrsafe.h>
 #include <wdmsec.h>
 #include <winfsp/fsctl.h>
+#include <winfsp/fsext.h>
 
 /* disable warnings */
 #pragma warning(disable:4100)           /* unreferenced formal parameter */
 #pragma warning(disable:4200)           /* zero-sized array in struct/union */
 
 #define DRIVER_NAME                     FSP_FSCTL_DRIVER_NAME
+
+#if _WIN64
+#define FSP_REGKEY                      "\\Registry\\Machine\\Software\\WOW6432Node\\WinFsp"
+#else
+#define FSP_REGKEY                      "\\Registry\\Machine\\Software\\WinFsp"
+#endif
 
 /* IoCreateDeviceSecure default SDDL's */
 #define FSP_FSCTL_DEVICE_SDDL           "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)"
@@ -492,6 +499,8 @@ PVOID FspAllocateIrpMustSucceed(CCHAR StackSize);
 NTSTATUS FspCreateGuid(GUID *Guid);
 NTSTATUS FspGetDeviceObjectPointer(PUNICODE_STRING ObjectName, ACCESS_MASK DesiredAccess,
     PULONG PFileNameIndex, PFILE_OBJECT *PFileObject, PDEVICE_OBJECT *PDeviceObject);
+NTSTATUS FspRegistryGetValue(PUNICODE_STRING Path, PUNICODE_STRING ValueName,
+    PKEY_VALUE_PARTIAL_INFORMATION ValueInformation, PULONG PValueInformationLength);
 NTSTATUS FspSendSetInformationIrp(PDEVICE_OBJECT DeviceObject, PFILE_OBJECT FileObject,
     FILE_INFORMATION_CLASS FileInformationClass, PVOID FileInformation, ULONG Length);
 NTSTATUS FspSendQuerySecurityIrp(PDEVICE_OBJECT DeviceObject, PFILE_OBJECT FileObject,
@@ -1055,7 +1064,8 @@ typedef struct
 {
     FSP_DEVICE_EXTENSION Base;
     UINT32 InitDoneFsvrt:1, InitDoneIoq:1, InitDoneSec:1, InitDoneDir:1, InitDoneStrm:1, InitDoneEa:1,
-        InitDoneCtxTab:1, InitDoneTimer:1, InitDoneInfo:1, InitDoneNotify:1, InitDoneStat:1;
+        InitDoneCtxTab:1, InitDoneTimer:1, InitDoneInfo:1, InitDoneNotify:1, InitDoneStat:1,
+        InitDoneFsext;
     PDEVICE_OBJECT FsctlDeviceObject;
     PDEVICE_OBJECT FsvrtDeviceObject;
     PDEVICE_OBJECT FsvolDeviceObject;
@@ -1085,6 +1095,7 @@ typedef struct
     PNOTIFY_SYNC NotifySync;
     LIST_ENTRY NotifyList;
     FSP_STATISTICS *Statistics;
+    FSP_FSCTL_DECLSPEC_ALIGN UINT8 FsextData[];
 } FSP_FSVOL_DEVICE_EXTENSION;
 typedef struct
 {
@@ -1176,6 +1187,9 @@ VOID FspDeviceGlobalUnlock(VOID)
     //(FILE_DEVICE_DISK_FILE_SYSTEM == (DeviceObject)->DeviceType ?\
     //    STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_NOT_CONNECTED)
 
+/* fsext */
+FSP_FSEXT_PROVIDER *FspFsextProvider(UINT32 FsextControlCode, PNTSTATUS PLoadResult);
+
 /* process buffers conditional usage */
 static inline
 BOOLEAN FspReadIrpShouldUseProcessBuffer(PIRP Irp, SIZE_T BufferSize)
@@ -1216,7 +1230,6 @@ NTSTATUS FspMupHandleIrp(
     PDEVICE_OBJECT FsmupDeviceObject, PIRP Irp);
 
 /* volume management */
-#define FspVolumeTransactEarlyTimeout   (1 * 10000ULL)
 NTSTATUS FspVolumeCreate(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 VOID FspVolumeDelete(
@@ -1228,6 +1241,8 @@ NTSTATUS FspVolumeGetName(
 NTSTATUS FspVolumeGetNameList(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeTransact(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeTransactFsext(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);

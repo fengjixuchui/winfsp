@@ -42,6 +42,8 @@ static NTSTATUS FspVolumeGetNameListNoLock(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeTransact(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeTransactFsext(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeWork(
@@ -59,6 +61,7 @@ NTSTATUS FspVolumeWork(
 #pragma alloc_text(PAGE, FspVolumeGetNameList)
 #pragma alloc_text(PAGE, FspVolumeGetNameListNoLock)
 #pragma alloc_text(PAGE, FspVolumeTransact)
+#pragma alloc_text(PAGE, FspVolumeTransactFsext)
 #pragma alloc_text(PAGE, FspVolumeStop)
 #pragma alloc_text(PAGE, FspVolumeWork)
 #endif
@@ -100,6 +103,7 @@ static NTSTATUS FspVolumeCreateNoLock(
     UNICODE_STRING VolumeName;
     UNICODE_STRING FsmupDeviceName;
     WCHAR VolumeNameBuf[FSP_FSCTL_VOLUME_NAME_SIZE / sizeof(WCHAR)];
+    FSP_FSEXT_PROVIDER *Provider = 0;
     PDEVICE_OBJECT FsvolDeviceObject;
     PDEVICE_OBJECT FsvrtDeviceObject;
     FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension;
@@ -132,7 +136,9 @@ static NTSTATUS FspVolumeCreateNoLock(
         VolumeParams.SectorsPerAllocationUnit = 1;
     if (0 == VolumeParams.MaxComponentLength)
         VolumeParams.MaxComponentLength = 255;
-    if (FspFsctlTransactTimeoutMinimum > VolumeParams.TransactTimeout ||
+    if (0 == VolumeParams.TransactTimeout)
+        VolumeParams.TransactTimeout = 24 * 60 * 60 * 1000; /* 1 day */
+    else if (FspFsctlTransactTimeoutMinimum > VolumeParams.TransactTimeout ||
         VolumeParams.TransactTimeout > FspFsctlTransactTimeoutMaximum)
         VolumeParams.TransactTimeout = FspFsctlTransactTimeoutDefault;
     if (FspFsctlIrpTimeoutMinimum > VolumeParams.IrpTimeout ||
@@ -207,6 +213,14 @@ static NTSTATUS FspVolumeCreateNoLock(
     VolumeParams.AlwaysUseDoubleBuffering = 1;
 #endif
 
+    /* load any fsext provider */
+    if (0 != VolumeParams.FsextControlCode)
+    {
+        Provider = FspFsextProvider(VolumeParams.FsextControlCode, &Result);
+        if (0 == Provider)
+            return Result;
+    }
+
     /* create volume guid */
     Result = FspCreateGuid(&Guid);
     if (!NT_SUCCESS(Result))
@@ -224,7 +238,8 @@ static NTSTATUS FspVolumeCreateNoLock(
     VolumeName.MaximumLength = VolumeName.Length;
 
     /* create the volume (and virtual disk) device(s) */
-    Result = FspDeviceCreate(FspFsvolDeviceExtensionKind, 0,
+    Result = FspDeviceCreate(FspFsvolDeviceExtensionKind,
+        0 == Provider ? 0 : Provider->DeviceExtensionSize,
         FsctlDeviceObject->DeviceType,
         FILE_DEVICE_DISK_FILE_SYSTEM == FsctlDeviceObject->DeviceType ? 0 : FILE_REMOTE_DEVICE,
         &FsvolDeviceObject);
@@ -270,6 +285,7 @@ static NTSTATUS FspVolumeCreateNoLock(
         if (0 != FsvrtDeviceObject)
             FspDeviceDereference(FsvrtDeviceObject);
         FspDeviceDereference(FsvolDeviceObject);
+        return Result;
     }
 
     /* do we need to register with fsmup? */
@@ -650,10 +666,8 @@ NTSTATUS FspVolumeTransact(
     ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
     ASSERT(
         FSP_FSCTL_TRANSACT == IrpSp->Parameters.FileSystemControl.FsControlCode ||
-        FSP_FSCTL_TRANSACT_BATCH == IrpSp->Parameters.FileSystemControl.FsControlCode);
-    ASSERT(
-        METHOD_BUFFERED == (IrpSp->Parameters.FileSystemControl.FsControlCode & 3) ||
-        METHOD_OUT_DIRECT == (IrpSp->Parameters.FileSystemControl.FsControlCode & 3));
+        FSP_FSCTL_TRANSACT_BATCH == IrpSp->Parameters.FileSystemControl.FsControlCode ||
+        FSP_FSCTL_TRANSACT_INTERNAL == IrpSp->Parameters.FileSystemControl.FsControlCode);
     ASSERT(0 != IrpSp->FileObject->FsContext2);
 
     /* check parameters */
@@ -661,17 +675,31 @@ NTSTATUS FspVolumeTransact(
     ULONG ControlCode = IrpSp->Parameters.FileSystemControl.FsControlCode;
     ULONG InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
     ULONG OutputBufferLength = IrpSp->Parameters.FileSystemControl.OutputBufferLength;
-    PVOID InputBuffer = Irp->AssociatedIrp.SystemBuffer;
+    PVOID InputBuffer = 0;
     PVOID OutputBuffer = 0;
-    if (0 != InputBufferLength &&
-        FSP_FSCTL_DEFAULT_ALIGN_UP(sizeof(FSP_FSCTL_TRANSACT_RSP)) > InputBufferLength)
-        return STATUS_INVALID_PARAMETER;
-    if (0 != OutputBufferLength &&
-        ((FSP_FSCTL_TRANSACT == ControlCode &&
-            FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN > OutputBufferLength) ||
-        (FSP_FSCTL_TRANSACT_BATCH == ControlCode &&
-            FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN > OutputBufferLength)))
-        return STATUS_BUFFER_TOO_SMALL;
+    if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+    {
+        InputBuffer = IrpSp->Parameters.FileSystemControl.Type3InputBuffer;
+        if (KernelMode != Irp->RequestorMode)
+            return STATUS_INVALID_DEVICE_REQUEST;
+        ASSERT(0 == InputBufferLength ||
+            FSP_FSCTL_DEFAULT_ALIGN_UP(sizeof(FSP_FSCTL_TRANSACT_RSP)) <= InputBufferLength);
+        ASSERT(0 == OutputBufferLength ||
+            sizeof(PVOID) <= OutputBufferLength);
+    }
+    else
+    {
+        InputBuffer = Irp->AssociatedIrp.SystemBuffer;
+        if (0 != InputBufferLength &&
+            FSP_FSCTL_DEFAULT_ALIGN_UP(sizeof(FSP_FSCTL_TRANSACT_RSP)) > InputBufferLength)
+            return STATUS_INVALID_PARAMETER;
+        if (0 != OutputBufferLength &&
+            ((FSP_FSCTL_TRANSACT == ControlCode &&
+                FSP_FSCTL_TRANSACT_BUFFER_SIZEMIN > OutputBufferLength) ||
+            (FSP_FSCTL_TRANSACT_BATCH == ControlCode &&
+                FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN > OutputBufferLength)))
+            return STATUS_BUFFER_TOO_SMALL;
+    }
 
     if (!FspDeviceReference(FsvolDeviceObject))
         return STATUS_CANCELLED;
@@ -681,6 +709,7 @@ NTSTATUS FspVolumeTransact(
     PUINT8 BufferEnd;
     FSP_FSCTL_TRANSACT_RSP *Response, *NextResponse;
     FSP_FSCTL_TRANSACT_REQ *Request, *PendingIrpRequest;
+    PVOID InternalBuffer = 0;
     PIRP ProcessIrp, PendingIrp, RetriedIrp, RepostedIrp;
     ULONG LoopCount;
     LARGE_INTEGER Timeout;
@@ -749,6 +778,9 @@ NTSTATUS FspVolumeTransact(
     /* were we sent an output buffer? */
     switch (ControlCode & 3)
     {
+    case METHOD_NEITHER:
+        OutputBuffer = Irp->UserBuffer;
+        break;
     case METHOD_OUT_DIRECT:
         if (0 != Irp->MdlAddress)
             OutputBuffer = MmGetMdlVirtualAddress(Irp->MdlAddress);
@@ -770,17 +802,17 @@ NTSTATUS FspVolumeTransact(
 
     /* wait for an IRP to arrive */
     KeQuerySystemTime(&Timeout);
-    Timeout.QuadPart += 0 == RepostedIrp ?
-        FsvolDeviceExtension->VolumeParams.TransactTimeout * 10000ULL :
-        FspVolumeTransactEarlyTimeout;
+    Timeout.QuadPart += FsvolDeviceExtension->VolumeParams.TransactTimeout * 10000ULL;
         /* convert millis to nanos and add to absolute time */
-    while (0 == (PendingIrp = FspIoqNextPendingIrp(FsvolDeviceExtension->Ioq, 0, &Timeout, Irp)))
+    if (0 == (PendingIrp = FspIoqNextPendingIrp(FsvolDeviceExtension->Ioq, 0, &Timeout, Irp)))
     {
         if (FspIoqStopped(FsvolDeviceExtension->Ioq))
         {
             Result = STATUS_CANCELLED;
             goto exit;
         }
+
+        PendingIrp = FspIoqTimeout;
     }
     if (FspIoqTimeout == PendingIrp || FspIoqCancelled == PendingIrp)
     {
@@ -793,7 +825,9 @@ NTSTATUS FspVolumeTransact(
     RepostedIrp = 0;
     Request = OutputBuffer;
     BufferEnd = (PUINT8)OutputBuffer + OutputBufferLength;
-    ASSERT(FspFsctlTransactCanProduceRequest(Request, BufferEnd));
+    ASSERT(FSP_FSCTL_TRANSACT_INTERNAL == ControlCode ?
+        TRUE :
+        FspFsctlTransactCanProduceRequest(Request, BufferEnd));
     LoopCount = FspIoqPendingIrpCount(FsvolDeviceExtension->Ioq);
     for (;;)
     {
@@ -814,8 +848,18 @@ NTSTATUS FspVolumeTransact(
             FspIopCompleteIrp(PendingIrp, Result);
         else
         {
-            RtlCopyMemory(Request, PendingIrpRequest, PendingIrpRequest->Size);
-            Request = FspFsctlTransactProduceRequest(Request, PendingIrpRequest->Size);
+            if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+            {
+                InternalBuffer = FspAllocatePoolMustSucceed(
+                    PagedPool, PendingIrpRequest->Size, FSP_ALLOC_EXTERNAL_TAG);
+                RtlCopyMemory(InternalBuffer, PendingIrpRequest, PendingIrpRequest->Size);
+                *(PVOID *)OutputBuffer = InternalBuffer;
+            }
+            else
+            {
+                RtlCopyMemory(Request, PendingIrpRequest, PendingIrpRequest->Size);
+                Request = FspFsctlTransactProduceRequest(Request, PendingIrpRequest->Size);
+            }
 
             if (!FspIoqStartProcessingIrp(FsvolDeviceExtension->Ioq, PendingIrp))
             {
@@ -826,12 +870,24 @@ NTSTATUS FspVolumeTransact(
                  * also cancel the PendingIrp we have in our hands.
                  */
                 ASSERT(FspIoqStopped(FsvolDeviceExtension->Ioq));
+                if (0 != InternalBuffer)
+                {
+                    ASSERT(FSP_FSCTL_TRANSACT_INTERNAL == ControlCode);
+                    FspFree(InternalBuffer);
+                }
                 FspIopCompleteCanceledIrp(PendingIrp);
                 Result = STATUS_CANCELLED;
                 goto exit;
             }
 
             /* are we doing single request or batch mode? */
+            if (FSP_FSCTL_TRANSACT_INTERNAL == ControlCode)
+            {
+                Irp->IoStatus.Information = sizeof(PVOID);
+                Result = STATUS_SUCCESS;
+                goto exit;
+            }
+            else
             if (FSP_FSCTL_TRANSACT == ControlCode)
                 break;
 
@@ -855,6 +911,36 @@ NTSTATUS FspVolumeTransact(
 exit:
     IoSetTopLevelIrp(TopLevelIrp);
     FspDeviceDereference(FsvolDeviceObject);
+    return Result;
+}
+
+NTSTATUS FspVolumeTransactFsext(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    PAGED_CODE();
+
+    ASSERT(IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction);
+    ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
+    ASSERT(CTL_CODE(0, 0xC00, 0, 0) ==
+        (IrpSp->Parameters.FileSystemControl.FsControlCode & CTL_CODE(0, 0xC00, 0, 0)));
+    ASSERT(0 != IrpSp->FileObject->FsContext2);
+
+    PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
+    if (!FspDeviceReference(FsvolDeviceObject))
+        return STATUS_CANCELLED;
+
+    NTSTATUS Result = STATUS_INVALID_DEVICE_REQUEST;
+    if (IrpSp->Parameters.FileSystemControl.FsControlCode ==
+        FspFsvolDeviceExtension(FsvolDeviceObject)->VolumeParams.FsextControlCode)
+    {
+        FSP_FSEXT_PROVIDER *Provider = FspFsextProvider(
+            IrpSp->Parameters.FileSystemControl.FsControlCode, 0);
+        if (0 != Provider)
+            Result = Provider->DeviceTransact(FsvolDeviceObject, Irp);
+    }
+
+    FspDeviceDereference(FsvolDeviceObject);
+
     return Result;
 }
 
