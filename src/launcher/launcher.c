@@ -464,7 +464,7 @@ typedef struct
     DWORD ProcessId;
     HANDLE Process;
     HANDLE ProcessWait;
-    HANDLE StdioHandles[2];
+    HANDLE StdioHandles[3];
     DWORD Recovery;
     ULONG Argc;
     PWSTR *Argv;
@@ -502,27 +502,28 @@ static SVC_INSTANCE *SvcInstanceLookup(PWSTR ClassName, PWSTR InstanceName)
     return 0;
 }
 
-static inline ULONG SvcInstanceArgumentLength(PWSTR Arg, PWSTR Pattern)
+static inline ULONG SvcInstanceArgumentLength(PWSTR Arg, PWSTR Pattern, BOOLEAN Quote)
 {
     PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern);
 
-    return 2 + (ULONG)(UINT_PTR)PathTransform(0, Arg, Pattern);
+    return (Quote ? 2 : 0) + (ULONG)((UINT_PTR)PathTransform(0, Arg, Pattern) / sizeof(WCHAR));
 }
 
-static inline PWSTR SvcInstanceArgumentCopy(PWSTR Dest, PWSTR Arg, PWSTR Pattern)
+static inline PWSTR SvcInstanceArgumentCopy(PWSTR Dest, PWSTR Arg, PWSTR Pattern, BOOLEAN Quote)
 {
     PWSTR PathTransform(PWSTR Dest, PWSTR Arg, PWSTR Pattern);
 
-    *Dest++ = L'"';
+    if (Quote)
+        *Dest++ = L'"';
     Dest = PathTransform(Dest, Arg, Pattern);
-    *Dest++ = L'"';
+    if (Quote)
+        *Dest++ = L'"';
 
     return Dest;
 }
 
 static NTSTATUS SvcInstanceReplaceArguments(PWSTR String,
-    ULONG Argc, PWSTR *Argv,
-    PWSTR UserName,
+    ULONG Argc, PWSTR *Argv, PWSTR *Varv, BOOLEAN Quote,
     PWSTR *PNewString)
 {
     PWSTR NewString = 0, P, Q;
@@ -544,24 +545,24 @@ static NTSTATUS SvcInstanceReplaceArguments(PWSTR String,
             {
                 Pattern = ++P;
                 while (!(L'\0' == *P ||
-                    (L'0' <= *P && *P <= '9') ||
-                    (L'A' <= *P && *P <= 'Z')))
+                    (L'0' <= *P && *P <= L'9') ||
+                    (L'A' <= *P && *P <= L'Z')))
                     P++;
             }
-            if (L'0' <= *P && *P <= '9')
+            if (L'0' <= *P && *P <= L'9')
             {
                 if (Argc > (ULONG)(*P - L'0'))
-                    Length += SvcInstanceArgumentLength(Argv[*P - L'0'], Pattern);
+                    Length += SvcInstanceArgumentLength(Argv[*P - L'0'], Pattern, Quote);
                 else
-                    Length += SvcInstanceArgumentLength(EmptyArg, 0);
+                    Length += SvcInstanceArgumentLength(EmptyArg, 0, Quote);
             }
             else
-            if (L'U' == *P)
+            if (L'A' <= *P && *P <= L'Z')
             {
-                if (0 != UserName)
-                    Length += SvcInstanceArgumentLength(UserName, Pattern);
+                if (0 != Varv[*P - L'A'])
+                    Length += SvcInstanceArgumentLength(Varv[*P - L'A'], Pattern, Quote);
                 else
-                    Length += SvcInstanceArgumentLength(EmptyArg, 0);
+                    Length += SvcInstanceArgumentLength(EmptyArg, 0, Quote);
             }
             else
             if (*P)
@@ -590,24 +591,24 @@ static NTSTATUS SvcInstanceReplaceArguments(PWSTR String,
             {
                 Pattern = ++P;
                 while (!(L'\0' == *P ||
-                    (L'0' <= *P && *P <= '9') ||
-                    (L'A' <= *P && *P <= 'Z')))
+                    (L'0' <= *P && *P <= L'9') ||
+                    (L'A' <= *P && *P <= L'Z')))
                     P++;
             }
-            if (L'0' <= *P && *P <= '9')
+            if (L'0' <= *P && *P <= L'9')
             {
                 if (Argc > (ULONG)(*P - L'0'))
-                    Q = SvcInstanceArgumentCopy(Q, Argv[*P - L'0'], Pattern);
+                    Q = SvcInstanceArgumentCopy(Q, Argv[*P - L'0'], Pattern, Quote);
                 else
-                    Q = SvcInstanceArgumentCopy(Q, EmptyArg, 0);
+                    Q = SvcInstanceArgumentCopy(Q, EmptyArg, 0, Quote);
             }
             else
-            if (L'U' == *P)
+            if (L'A' <= *P && *P <= L'Z')
             {
-                if (0 != UserName)
-                    Q = SvcInstanceArgumentCopy(Q, UserName, Pattern);
+                if (0 != Varv[*P - L'A'])
+                    Q = SvcInstanceArgumentCopy(Q, Varv[*P - L'A'], Pattern, Quote);
                 else
-                    Q = SvcInstanceArgumentCopy(Q, EmptyArg, 0);
+                    Q = SvcInstanceArgumentCopy(Q, EmptyArg, 0, Quote);
             }
             else
             if (*P)
@@ -718,14 +719,15 @@ static NTSTATUS SvcInstanceAccessCheck(HANDLE ClientToken, ULONG DesiredAccess,
 
 static NTSTATUS SvcInstanceCreateProcess(PWSTR UserName, HANDLE ClientToken,
     PWSTR Executable, PWSTR CommandLine, PWSTR WorkDirectory,
-    HANDLE StdioHandles[2],
+    HANDLE StdioHandles[2], HANDLE StderrHandle,
     PPROCESS_INFORMATION ProcessInfo)
 {
     WCHAR WorkDirectoryBuf[MAX_PATH];
     STARTUPINFOEXW StartupInfoEx;
-    HANDLE ChildHandles[3] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, 0/* DO NOT CLOSE!*/ };
+    HANDLE ChildHandles[3] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE/* NO CLOSE!*/ };
     HANDLE ParentHandles[2] = { INVALID_HANDLE_VALUE, INVALID_HANDLE_VALUE };
     PPROC_THREAD_ATTRIBUTE_LIST AttrList = 0;
+    BOOLEAN InitDoneAttrList = FALSE;
     SIZE_T Size;
     NTSTATUS Result;
 
@@ -748,7 +750,7 @@ static NTSTATUS SvcInstanceCreateProcess(PWSTR UserName, HANDLE ClientToken,
     memset(&StartupInfoEx, 0, sizeof StartupInfoEx);
     StartupInfoEx.StartupInfo.cb = sizeof StartupInfoEx.StartupInfo;
 
-    if (0 != StdioHandles)
+    if (0 != StdioHandles || INVALID_HANDLE_VALUE != StderrHandle)
     {
         /*
          * Create child process and redirect stdin/stdout. Do *not* inherit other handles.
@@ -757,23 +759,30 @@ static NTSTATUS SvcInstanceCreateProcess(PWSTR UserName, HANDLE ClientToken,
          *     https://blogs.msdn.microsoft.com/oldnewthing/20111216-00/?p=8873/
          */
 
-        /* create stdin read/write ends; make them inheritable */
-        if (!CreateOverlappedPipe(&ChildHandles[0], &ParentHandles[0],
-            0, TRUE, FALSE, 0, 0))
+        if (0 != StdioHandles)
         {
-            Result = FspNtStatusFromWin32(GetLastError());
-            goto exit;
+            /* create stdin read/write ends; make them inheritable */
+            if (!CreateOverlappedPipe(&ChildHandles[0], &ParentHandles[0],
+                0, TRUE, FALSE, 0, 0))
+            {
+                Result = FspNtStatusFromWin32(GetLastError());
+                goto exit;
+            }
         }
 
-        /* create stdout read/write ends; make them inheritable */
-        if (!CreateOverlappedPipe(&ParentHandles[1], &ChildHandles[1],
-            0, FALSE, TRUE, FILE_FLAG_OVERLAPPED, 0))
+        if (0 != StdioHandles)
         {
-            Result = FspNtStatusFromWin32(GetLastError());
-            goto exit;
+            /* create stdout read/write ends; make them inheritable */
+            if (!CreateOverlappedPipe(&ParentHandles[1], &ChildHandles[1],
+                0, FALSE, TRUE, FILE_FLAG_OVERLAPPED, 0))
+            {
+                Result = FspNtStatusFromWin32(GetLastError());
+                goto exit;
+            }
         }
 
-        ChildHandles[2] = GetStdHandle(STD_ERROR_HANDLE);
+        if (INVALID_HANDLE_VALUE != StderrHandle)
+            ChildHandles[2] = StderrHandle;
 
         Size = 0;
         if (!InitializeProcThreadAttributeList(0, 1, 0, &Size) &&
@@ -795,10 +804,14 @@ static NTSTATUS SvcInstanceCreateProcess(PWSTR UserName, HANDLE ClientToken,
             Result = FspNtStatusFromWin32(GetLastError());
             goto exit;
         }
+        InitDoneAttrList = TRUE;
 
-        /* only the child ends of stdin/stdout are actually inherited */
+        /* only the child ends of stdin/stdout/stderr are actually inherited */
         if (!UpdateProcThreadAttribute(AttrList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            ChildHandles, sizeof ChildHandles, 0, 0))
+            0 != StdioHandles ? ChildHandles : ChildHandles + 2,
+            ((0 != StdioHandles ? 2 : 0) + (INVALID_HANDLE_VALUE != StderrHandle ? 1 : 0)) *
+                sizeof ChildHandles[0],
+            0, 0))
         {
             Result = FspNtStatusFromWin32(GetLastError());
             goto exit;
@@ -863,7 +876,7 @@ exit:
     {
         if (INVALID_HANDLE_VALUE != ParentHandles[0])
             CloseHandle(ParentHandles[0]);
-        if (INVALID_HANDLE_VALUE != ParentHandles[0])
+        if (INVALID_HANDLE_VALUE != ParentHandles[1])
             CloseHandle(ParentHandles[1]);
     }
     else if (0 != StdioHandles)
@@ -877,6 +890,8 @@ exit:
     if (INVALID_HANDLE_VALUE != ChildHandles[1])
         CloseHandle(ChildHandles[1]);
 
+    if (InitDoneAttrList)
+        DeleteProcThreadAttributeList(AttrList);
     MemFree(AttrList);
 
     return Result;
@@ -888,30 +903,28 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
     SVC_INSTANCE **PSvcInstance)
 {
     SVC_INSTANCE *SvcInstance = 0;
-    PWSTR ClientUserName = 0;
-    DWORD ClientTokenInformation = -1;
-    HKEY RegKey = 0;
-    DWORD RegResult, RegSize;
-    DWORD ClassNameSize, InstanceNameSize;
-    WCHAR Executable[MAX_PATH], CommandLineBuf[512], WorkDirectory[MAX_PATH],
-        SecurityBuf[512], RunAsBuf[64];
-    PWSTR CommandLine, Security;
-    DWORD Credentials, JobControl, Recovery;
-    PSECURITY_DESCRIPTOR SecurityDescriptor = 0, NewSecurityDescriptor;
     PWSTR Argv[10];
+    PWSTR Varv[26];
+    SYSTEMTIME SystemTime;
+    PWSTR ClientUserName = 0, StderrFileName = 0;
+    DWORD ClientTokenInformation = -1;
+    SECURITY_ATTRIBUTES StderrSecurityAttributes = { sizeof(SECURITY_ATTRIBUTES), 0, TRUE };
+    FSP_LAUNCH_REG_RECORD *Record = 0;
+    WCHAR CurrentTime[32], UserProfileDir[MAX_PATH], CommandLine[512], Security[512];
+    DWORD Length, ClassNameSize, InstanceNameSize;
+    PSECURITY_DESCRIPTOR SecurityDescriptor = 0, NewSecurityDescriptor;
     PROCESS_INFORMATION ProcessInfo;
     NTSTATUS Result;
 
     *PSvcInstance = 0;
-
-    lstrcpyW(CommandLineBuf, L"%0 ");
-    lstrcpyW(SecurityBuf, L"O:SYG:SY");
 
     if (Argc > sizeof Argv / sizeof Argv[0] - 1)
         Argc = sizeof Argv / sizeof Argv[0] - 1;
     memcpy(Argv + 1, Argv0, Argc * sizeof(PWSTR));
     Argv[0] = 0;
     Argc++;
+
+    memset(Varv, 0, sizeof Varv);
 
     memset(&ProcessInfo, 0, sizeof ProcessInfo);
 
@@ -923,115 +936,62 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
         goto exit;
     }
 
+    GetSystemTime(&SystemTime);
+    wsprintfW(CurrentTime, L"%04hu%02hu%02huT%02hu%02hu%02hu.%03huZ",
+        SystemTime.wYear, SystemTime.wMonth, SystemTime.wDay,
+        SystemTime.wHour, SystemTime.wMinute, SystemTime.wSecond,
+        SystemTime.wMilliseconds);
+    Varv[L'T' - L'A'] = CurrentTime;
+
     Result = GetTokenUserName(ClientToken, &ClientUserName);
     if (!NT_SUCCESS(Result))
         goto exit;
+    Varv[L'U' - L'A'] = ClientUserName;
 
-    RegResult = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"" FSP_LAUNCH_REGKEY,
-        0, FSP_LAUNCH_REGKEY_WOW64 | KEY_READ, &RegKey);
-    if (ERROR_SUCCESS != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
-    }
+    Length = MAX_PATH;
+    if (!GetUserProfileDirectoryW(ClientToken, UserProfileDir, &Length))
+        /* store an invalid filename; any attempt to use it will fail */
+        lstrcpyW(UserProfileDir, L":INVALID:");
+    Varv[L'P' - L'A'] = UserProfileDir;
 
-    RegSize = sizeof Credentials;
-    Credentials = 0;
-    RegResult = RegGetValueW(RegKey, ClassName, L"Credentials", RRF_RT_REG_DWORD, 0,
-        &Credentials, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
+    Result = FspLaunchRegGetRecord(ClassName, 0, &Record);
+    if (!NT_SUCCESS(Result))
         goto exit;
-    }
-    if ((!RedirectStdio && 0 != Credentials) ||
-        ( RedirectStdio && 0 == Credentials))
+
+    if ((!RedirectStdio && 0 != Record->Credentials) ||
+        ( RedirectStdio && 0 == Record->Credentials))
     {
         Result = STATUS_DEVICE_CONFIGURATION_ERROR;
         goto exit;
     }
 
-    RegSize = sizeof Executable;
-    Executable[0] = L'\0';
-    RegResult = RegGetValueW(RegKey, ClassName, L"Executable", RRF_RT_REG_SZ, 0,
-        Executable, &RegSize);
-    if (ERROR_SUCCESS != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
-    }
-    Argv[0] = Executable;
+    Argv[0] = Record->Executable;
 
-    CommandLine = CommandLineBuf + lstrlenW(CommandLineBuf);
-    RegSize = (DWORD)(sizeof CommandLineBuf - (CommandLine - CommandLineBuf) * sizeof(WCHAR));
-    RegResult = RegGetValueW(RegKey, ClassName, L"CommandLine", RRF_RT_REG_SZ, 0,
-        CommandLine, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
+    lstrcpyW(CommandLine, L"%0 ");
+    if (0 != Record->CommandLine)
     {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
-    }
-    if (ERROR_FILE_NOT_FOUND == RegResult)
-        CommandLine[-1] = L'\0';
-    CommandLine = CommandLineBuf;
-
-    RegSize = sizeof WorkDirectory;
-    WorkDirectory[0] = L'\0';
-    RegResult = RegGetValueW(RegKey, ClassName, L"WorkDirectory", RRF_RT_REG_SZ, 0,
-        WorkDirectory, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
+        Length = lstrlenW(CommandLine);
+        lstrcpynW(CommandLine + Length, Record->CommandLine,
+            sizeof CommandLine / sizeof(WCHAR) - Length);
+        CommandLine[sizeof CommandLine / sizeof(WCHAR) - 1] = L'\0';
     }
 
-    Security = SecurityBuf + lstrlenW(SecurityBuf);
-    RegSize = (DWORD)(sizeof SecurityBuf - (Security - SecurityBuf) * sizeof(WCHAR));
-    RegResult = RegGetValueW(RegKey, ClassName, L"Security", RRF_RT_REG_SZ, 0,
-        Security, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
+    lstrcpyW(Security, L"O:SYG:SY");
+    if (0 != Record->Security)
     {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
+        if (L'D' == Record->Security[0] && L':' == Record->Security[1])
+            Length = lstrlenW(Security);
+        else
+            Length = 0;
+        lstrcpynW(Security + Length, Record->Security,
+            sizeof Security / sizeof(WCHAR) - Length);
+        Security[sizeof Security / sizeof(WCHAR) - 1] = L'\0';
     }
-
-    RegSize = sizeof RunAsBuf;
-    RunAsBuf[0] = L'\0';
-    RegResult = RegGetValueW(RegKey, ClassName, L"RunAs", RRF_RT_REG_SZ, 0,
-        RunAsBuf, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
+    else
     {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
+        Length = lstrlenW(Security);
+        lstrcpyW(Security + Length, L"" FSP_LAUNCH_SERVICE_DEFAULT_SDDL);
     }
-
-    RegSize = sizeof JobControl;
-    JobControl = 1; /* default is YES! */
-    RegResult = RegGetValueW(RegKey, ClassName, L"JobControl", RRF_RT_REG_DWORD, 0,
-        &JobControl, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
-    }
-
-    RegSize = sizeof Recovery;
-    Recovery = 0;
-    RegResult = RegGetValueW(RegKey, ClassName, L"Recovery", RRF_RT_REG_DWORD, 0,
-        &Recovery, &RegSize);
-    if (ERROR_SUCCESS != RegResult && ERROR_FILE_NOT_FOUND != RegResult)
-    {
-        Result = FspNtStatusFromWin32(RegResult);
-        goto exit;
-    }
-
-    RegCloseKey(RegKey);
-    RegKey = 0;
-
-    if (L'\0' == Security[0])
-        lstrcpyW(Security, L"" FSP_LAUNCH_SERVICE_DEFAULT_SDDL);
-    if (L'D' == Security[0] && L':' == Security[1])
-        Security = SecurityBuf;
 
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(Security, SDDL_REVISION_1,
         &SecurityDescriptor, 0))
@@ -1039,8 +999,6 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
         Result = FspNtStatusFromWin32(GetLastError());
         goto exit;
     }
-
-    //FspDebugLogSD(__FUNCTION__ ": SDDL = %s\n", SecurityDescriptor);
 
     Result = SvcInstanceAccessCheck(ClientToken, SERVICE_START, SecurityDescriptor);
     if (!NT_SUCCESS(Result))
@@ -1051,8 +1009,6 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
         goto exit;
     LocalFree(SecurityDescriptor);
     SecurityDescriptor = NewSecurityDescriptor;
-
-    //FspDebugLogSD(__FUNCTION__ ": SDDL = %s\n", SecurityDescriptor);
 
     ClassNameSize = (lstrlenW(ClassName) + 1) * sizeof(WCHAR);
     InstanceNameSize = (lstrlenW(InstanceName) + 1) * sizeof(WCHAR);
@@ -1071,7 +1027,7 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
             HANDLE_FLAG_PROTECT_FROM_CLOSE | 0))
     {
         ClientTokenInformation = -1;
-        Result = FspNtStatusFromWin32(RegResult);
+        Result = FspNtStatusFromWin32(GetLastError());
         goto exit;
     }
 
@@ -1085,18 +1041,43 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
     SvcInstance->SecurityDescriptor = SecurityDescriptor;
     SvcInstance->StdioHandles[0] = INVALID_HANDLE_VALUE;
     SvcInstance->StdioHandles[1] = INVALID_HANDLE_VALUE;
-    SvcInstance->Recovery = Recovery;
+    SvcInstance->StdioHandles[2] = INVALID_HANDLE_VALUE;
+    SvcInstance->Recovery = Record->Recovery;
 
-    Result = SvcInstanceReplaceArguments(CommandLine,
-        Argc, Argv,
-        ClientUserName,
+    Result = SvcInstanceReplaceArguments(CommandLine, Argc, Argv, Varv, TRUE,
         &SvcInstance->CommandLine);
     if (!NT_SUCCESS(Result))
         goto exit;
 
-    Result = SvcInstanceCreateProcess(L'\0' != RunAsBuf[0] ? RunAsBuf : 0, ClientToken,
-        Executable, SvcInstance->CommandLine, L'\0' != WorkDirectory[0] ? WorkDirectory : 0,
-        RedirectStdio ? SvcInstance->StdioHandles : 0, &ProcessInfo);
+    if (0 != Record->Stderr)
+    {
+        Result = SvcInstanceReplaceArguments(Record->Stderr, Argc, Argv, Varv, FALSE,
+            &StderrFileName);
+        if (!NT_SUCCESS(Result))
+            goto exit;
+
+        SvcInstance->StdioHandles[2] = CreateFileW(
+            StderrFileName,
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &StderrSecurityAttributes,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            0);
+        if (INVALID_HANDLE_VALUE == SvcInstance->StdioHandles[2])
+            FspServiceLog(EVENTLOG_WARNING_TYPE,
+                L"Ignorning error: cannot create stderr file = %ld", GetLastError());
+    }
+
+    Result = SvcInstanceCreateProcess(
+        Record->RunAs,
+        ClientToken,
+        Record->Executable,
+        SvcInstance->CommandLine,
+        Record->WorkDirectory,
+        RedirectStdio ? SvcInstance->StdioHandles : 0,
+        SvcInstance->StdioHandles[2],
+        &ProcessInfo);
     if (!NT_SUCCESS(Result))
         goto exit;
 
@@ -1110,7 +1091,7 @@ NTSTATUS SvcInstanceCreate(HANDLE ClientToken,
         goto exit;
     }
 
-    if (0 != Job && JobControl)
+    if (0 != Job && Record->JobControl)
     {
         if (!AssignProcessToJobObject(Job, SvcInstance->Process))
             FspServiceLog(EVENTLOG_WARNING_TYPE,
@@ -1151,6 +1132,8 @@ exit:
                 CloseHandle(SvcInstance->StdioHandles[0]);
             if (INVALID_HANDLE_VALUE != SvcInstance->StdioHandles[1])
                 CloseHandle(SvcInstance->StdioHandles[1]);
+            if (INVALID_HANDLE_VALUE != SvcInstance->StdioHandles[2])
+                CloseHandle(SvcInstance->StdioHandles[2]);
 
             if (0 != SvcInstance->ProcessWait)
                 UnregisterWaitEx(SvcInstance->ProcessWait, 0);
@@ -1166,9 +1149,10 @@ exit:
         }
     }
 
-    if (0 != RegKey)
-        RegCloseKey(RegKey);
+    if (0 != Record)
+        FspLaunchRegFreeRecord(Record);
 
+    MemFree(StderrFileName);
     MemFree(ClientUserName);
 
     LeaveCriticalSection(&SvcInstanceLock);
@@ -1206,6 +1190,8 @@ static VOID SvcInstanceRelease(SVC_INSTANCE *SvcInstance)
         CloseHandle(SvcInstance->StdioHandles[0]);
     if (INVALID_HANDLE_VALUE != SvcInstance->StdioHandles[1])
         CloseHandle(SvcInstance->StdioHandles[1]);
+    if (INVALID_HANDLE_VALUE != SvcInstance->StdioHandles[2])
+        CloseHandle(SvcInstance->StdioHandles[2]);
 
     if (0 != SvcInstance->ProcessWait)
         UnregisterWaitEx(SvcInstance->ProcessWait, 0);
@@ -1328,6 +1314,11 @@ exit:
     {
         CloseHandle(SvcInstance->StdioHandles[1]);
         SvcInstance->StdioHandles[1] = INVALID_HANDLE_VALUE;
+    }
+    if (INVALID_HANDLE_VALUE != SvcInstance->StdioHandles[2])
+    {
+        CloseHandle(SvcInstance->StdioHandles[2]);
+        SvcInstance->StdioHandles[2] = INVALID_HANDLE_VALUE;
     }
 
     if (NT_SUCCESS(Result))
