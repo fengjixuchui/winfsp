@@ -1187,6 +1187,72 @@ FSP_API VOID FspFileSystemStopDispatcher(FSP_FILE_SYSTEM *FileSystem);
 FSP_API VOID FspFileSystemSendResponse(FSP_FILE_SYSTEM *FileSystem,
     FSP_FSCTL_TRANSACT_RSP *Response);
 /**
+ * Begin notifying Windows that the file system has file changes.
+ *
+ * A file system that wishes to notify Windows about file changes must
+ * first issue an FspFileSystemBegin call, followed by 0 or more
+ * FspFileSystemNotify calls, followed by an FspFileSystemNotifyEnd call.
+ *
+ * This operation blocks concurrent file rename operations. File rename
+ * operations may interfere with file notification, because a file being
+ * notified may also be concurrently renamed. After all file change
+ * notifications have been issued, you must make sure to call
+ * FspFileSystemNotifyEnd to allow file rename operations to proceed.
+ *
+ * @param FileSystem
+ *     The file system object.
+ * @return
+ *     STATUS_SUCCESS or error code. The error code STATUS_CANT_WAIT means that
+ *     a file rename operation is currently in progress and the operation must be
+ *     retried at a later time.
+ */
+FSP_API NTSTATUS FspFileSystemNotifyBegin(FSP_FILE_SYSTEM *FileSystem, ULONG Timeout);
+/**
+ * End notifying Windows that the file system has file changes.
+ *
+ * A file system that wishes to notify Windows about file changes must
+ * first issue an FspFileSystemBegin call, followed by 0 or more
+ * FspFileSystemNotify calls, followed by an FspFileSystemNotifyEnd call.
+ *
+ * This operation allows any blocked file rename operations to proceed.
+ *
+ * @param FileSystem
+ *     The file system object.
+ * @return
+ *     STATUS_SUCCESS or error code.
+ */
+FSP_API NTSTATUS FspFileSystemNotifyEnd(FSP_FILE_SYSTEM *FileSystem);
+/**
+ * Notify Windows that the file system has file changes.
+ *
+ * A file system that wishes to notify Windows about file changes must
+ * first issue an FspFileSystemBegin call, followed by 0 or more
+ * FspFileSystemNotify calls, followed by an FspFileSystemNotifyEnd call.
+ *
+ * Note that FspFileSystemNotify requires file names to be normalized. A
+ * normalized file name is one that contains the correct case of all characters
+ * in the file name.
+ *
+ * For case-sensitive file systems all file names are normalized by definition.
+ * For case-insensitive file systems that implement file name normalization,
+ * a normalized file name is the one that the file system specifies in the
+ * response to Create or Open (see also FspFileSystemGetOpenFileInfo). For
+ * case-insensitive file systems that do not implement file name normalization
+ * a normalized file name is the upper case version of the file name used
+ * to open the file.
+ *
+ * @param FileSystem
+ *     The file system object.
+ * @param NotifyInfo
+ *     Buffer containing information about file changes.
+ * @param Size
+ *     Size of buffer.
+ * @return
+ *     STATUS_SUCCESS or error code.
+ */
+FSP_API NTSTATUS FspFileSystemNotify(FSP_FILE_SYSTEM *FileSystem,
+    FSP_FSCTL_NOTIFY_INFO *NotifyInfo, SIZE_T Size);
+/**
  * Get the current operation context.
  *
  * This function may be used only when servicing one of the FSP_FILE_SYSTEM_INTERFACE operations.
@@ -1645,6 +1711,28 @@ UINT32 FspFileSystemGetEaPackedSize(PFILE_FULL_EA_INFORMATION SingleEa)
     /* magic computations are courtesy of NTFS */
     return 5 + SingleEa->EaNameLength + SingleEa->EaValueLength;
 }
+/**
+ * Add notify information to a buffer.
+ *
+ * This is a helper for filling a buffer to use with FspFileSystemNotify.
+ *
+ * @param NotifyInfo
+ *     The notify information to add.
+ * @param Buffer
+ *     Pointer to a buffer that will receive the notify information.
+ * @param Length
+ *     Length of buffer.
+ * @param PBytesTransferred [out]
+ *     Pointer to a memory location that will receive the actual number of bytes stored. This should
+ *     be initialized to 0 prior to the first call to FspFileSystemAddNotifyInfo for a particular
+ *     buffer.
+ * @return
+ *     TRUE if the notify information was added, FALSE if there was not enough space to add it.
+ * @see
+ *     FspFileSystemNotify
+ */
+FSP_API BOOLEAN FspFileSystemAddNotifyInfo(FSP_FSCTL_NOTIFY_INFO *NotifyInfo,
+    PVOID Buffer, ULONG Length, PULONG PBytesTransferred);
 
 /*
  * Directory buffering

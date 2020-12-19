@@ -50,6 +50,11 @@ NTSTATUS FspVolumeTransactFsext(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeNotify(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+static NTSTATUS FspVolumeNotifyLock(
+    PDEVICE_OBJECT FsvolDeviceObject);
+static WORKER_THREAD_ROUTINE FspVolumeNotifyWork;
 NTSTATUS FspVolumeWork(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
@@ -68,6 +73,9 @@ NTSTATUS FspVolumeWork(
 #pragma alloc_text(PAGE, FspVolumeTransact)
 #pragma alloc_text(PAGE, FspVolumeTransactFsext)
 #pragma alloc_text(PAGE, FspVolumeStop)
+#pragma alloc_text(PAGE, FspVolumeNotify)
+#pragma alloc_text(PAGE, FspVolumeNotifyLock)
+#pragma alloc_text(PAGE, FspVolumeNotifyWork)
 #pragma alloc_text(PAGE, FspVolumeWork)
 #endif
 
@@ -467,6 +475,11 @@ static VOID FspVolumeDeleteNoLock(
         IoDeleteSymbolicLink(&FsvolDeviceExtension->VolumeName);
         FspMupUnregister(Globals->FsmupDeviceObject, FsvolDeviceObject);
     }
+
+    /* release the volume notify lock if held (so that any pending rename will abort) */
+    FspWgroupSignalPermanently(&FsvolDeviceExtension->VolumeNotifyWgroup);
+    if (1 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 0, 1))
+        FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject, FsvolDeviceObject);
 
     /* release the volume device object */
     FspDeviceDereference(FsvolDeviceObject);
@@ -1052,6 +1065,222 @@ NTSTATUS FspVolumeStop(
     FspIoqStop(FsvolDeviceExtension->Ioq);
 
     return STATUS_SUCCESS;
+}
+
+typedef struct
+{
+    WORK_QUEUE_ITEM WorkItem;
+    PDEVICE_OBJECT FsvolDeviceObject;
+    ULONG InputBufferLength;
+    FSP_FSCTL_DECLSPEC_ALIGN UINT8 InputBuffer[];
+} FSP_VOLUME_NOTIFY_WORK_ITEM;
+
+NTSTATUS FspVolumeNotify(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+{
+    PAGED_CODE();
+
+    /*
+     * FspVolumeNotify processing requires multiple locks that cannot be acquired
+     * synchronously or deadlocks are possible. (The reason is that FspVolumeNotify
+     * may be called by the user mode file system while servicing a request that
+     * has already acquired one of the required locks.)
+     *
+     * For this reason FspVolumeNotify does its processing asynchronously; it ships
+     * its payload as a work item to a system worker thread, which will perform the
+     * actual processing. See FspVolumeNotifyWork.
+     */
+
+    ASSERT(IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction);
+    ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
+    ASSERT(FSP_FSCTL_NOTIFY == IrpSp->Parameters.FileSystemControl.FsControlCode);
+    ASSERT(METHOD_NEITHER == (IrpSp->Parameters.FileSystemControl.FsControlCode & 3));
+    ASSERT(0 != IrpSp->FileObject->FsContext2);
+
+    PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    PVOID InputBuffer = IrpSp->Parameters.FileSystemControl.Type3InputBuffer;
+    ULONG InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
+    FSP_VOLUME_NOTIFY_WORK_ITEM *NotifyWorkItem = 0;
+    NTSTATUS Result;
+
+    if (0 == InputBufferLength)
+        return FspVolumeNotifyLock(FsvolDeviceObject);
+
+    if (!FspDeviceReference(FsvolDeviceObject))
+        return STATUS_CANCELLED;
+
+    NotifyWorkItem = FspAllocNonPaged(
+        FIELD_OFFSET(FSP_VOLUME_NOTIFY_WORK_ITEM, InputBuffer) + InputBufferLength);
+    if (0 == NotifyWorkItem)
+    {
+        Result = STATUS_INSUFFICIENT_RESOURCES;
+        goto fail;
+    }
+
+    try
+    {
+        ProbeForRead(InputBuffer, InputBufferLength, 1);
+        RtlCopyMemory(NotifyWorkItem->InputBuffer, InputBuffer, InputBufferLength);
+        NotifyWorkItem->InputBufferLength = InputBufferLength;
+    }
+    except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Result = GetExceptionCode();
+        Result = FsRtlIsNtstatusExpected(Result) ? STATUS_INVALID_USER_BUFFER : Result;
+        goto fail;
+    }
+
+    ExInitializeWorkItem(&NotifyWorkItem->WorkItem, FspVolumeNotifyWork, NotifyWorkItem);
+    NotifyWorkItem->FsvolDeviceObject = FsvolDeviceObject;
+
+    FspWgroupIncrement(&FsvolDeviceExtension->VolumeNotifyWgroup);
+    ExQueueWorkItem(&NotifyWorkItem->WorkItem, DelayedWorkQueue);
+
+    return STATUS_SUCCESS;
+
+fail:
+    if (0 != NotifyWorkItem)
+        FspFree(NotifyWorkItem);
+
+    FspDeviceDereference(FsvolDeviceObject);
+
+    return Result;
+}
+
+static NTSTATUS FspVolumeNotifyLock(
+    PDEVICE_OBJECT FsvolDeviceObject)
+{
+    PAGED_CODE();
+
+    NTSTATUS Result;
+
+    if (!FspDeviceReference(FsvolDeviceObject))
+        return STATUS_CANCELLED;
+
+    /*
+     * Acquire the rename lock shared to disallow concurrent RENAME's.
+     *
+     * This guards against the race where a file that we want to invalidate
+     * is being concurrently renamed to a different name. Thus we may think
+     * that the file is not open and not invalidate its caches, whereas the
+     * file has simply changed name.
+     */
+    Result = STATUS_CANT_WAIT;
+    if (FspFsvolDeviceFileRenameTryAcquireShared(FsvolDeviceObject))
+    {
+        FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+
+        if (0 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 1, 0))
+        {
+            FspFsvolDeviceFileRenameSetOwner(FsvolDeviceObject, FsvolDeviceObject);
+            Result = STATUS_SUCCESS;
+        }
+        else
+            FspFsvolDeviceFileRenameRelease(FsvolDeviceObject);
+    }
+
+    FspDeviceDereference(FsvolDeviceObject);
+
+    return Result;
+}
+
+static VOID FspVolumeNotifyWork(PVOID NotifyWorkItem0)
+{
+    PAGED_CODE();
+
+    FsRtlEnterFileSystem();
+    IoSetTopLevelIrp(0);
+
+    FSP_VOLUME_NOTIFY_WORK_ITEM *NotifyWorkItem = NotifyWorkItem0;
+    PDEVICE_OBJECT FsvolDeviceObject = NotifyWorkItem->FsvolDeviceObject;
+    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
+    FSP_FSCTL_NOTIFY_INFO *NotifyInfo = (PVOID)NotifyWorkItem->InputBuffer;
+    PUINT8 NotifyInfoEnd = (PUINT8)NotifyInfo + NotifyWorkItem->InputBufferLength;
+    ULONG NotifyInfoSize;
+    UNICODE_STRING FileName = { 0 }, StreamPart = { 0 }, AbsFileName = { 0 }, FullFileName = { 0 };
+    ULONG StreamType = FspFileNameStreamTypeNone;
+    BOOLEAN Unlock = FALSE;
+    NTSTATUS Result;
+
+    /* iterate over notify information and invalidate/notify each file */
+    for (; (PUINT8)NotifyInfo + sizeof(NotifyInfo->Size) <= NotifyInfoEnd;
+        NotifyInfo = (PVOID)((PUINT8)NotifyInfo + FSP_FSCTL_DEFAULT_ALIGN_UP(NotifyInfoSize)))
+    {
+        NotifyInfoSize = NotifyInfo->Size;
+
+        if (sizeof(FSP_FSCTL_NOTIFY_INFO) > NotifyInfoSize)
+        {
+            Unlock = TRUE;
+            break;
+        }
+
+        FileName.Length =
+        FileName.MaximumLength = (USHORT)(NotifyInfoSize - sizeof(FSP_FSCTL_NOTIFY_INFO));
+        FileName.Buffer = NotifyInfo->FileNameBuf;
+        if (sizeof(WCHAR) * 2/* not empty or root */ <= FileName.Length &&
+            L'\\' == FileName.Buffer[FileName.Length / sizeof(WCHAR) - 1])
+            FileName.Length -= sizeof(WCHAR);
+
+        if (!FspFileNameIsValid(&FileName, FsvolDeviceExtension->VolumeParams.MaxComponentLength,
+            FsvolDeviceExtension->VolumeParams.NamedStreams ? &StreamPart : 0,
+            &StreamType))
+            continue;
+
+        if (sizeof(WCHAR) <= FileName.Length && L'\\' == FileName.Buffer[0])
+        {
+            /* absolute file names are used as-is */
+
+            AbsFileName = FileName;
+
+            FspFileNodeInvalidateCachesAndNotifyChangeByName(FsvolDeviceObject,
+                &FileName, NotifyInfo->Filter, NotifyInfo->Action,
+                TRUE);
+        }
+        else if (0 != AbsFileName.Length)
+        {
+            /* relative file names are considered relative to the last absolute file name */
+
+            if (0 == FullFileName.Buffer)
+            {
+                FullFileName.Buffer = FspAllocatePoolMustSucceed(
+                    NonPagedPool, FSP_FSCTL_TRANSACT_PATH_SIZEMAX, FSP_ALLOC_INTERNAL_TAG);
+                FullFileName.MaximumLength = FSP_FSCTL_TRANSACT_PATH_SIZEMAX;
+            }
+
+            FullFileName.Length = 0;
+            Result = RtlAppendUnicodeStringToString(&FullFileName, &AbsFileName);
+            if (NT_SUCCESS(Result))
+            {
+                if (sizeof(WCHAR) * 2/* not empty or root */ <= AbsFileName.Length)
+                    Result = RtlAppendUnicodeToString(&FullFileName, L"\\");
+            }
+            if (NT_SUCCESS(Result))
+                Result = RtlAppendUnicodeStringToString(&FullFileName, &FileName);
+
+            if (NT_SUCCESS(Result))
+                FspFileNodeInvalidateCachesAndNotifyChangeByName(FsvolDeviceObject,
+                    &FullFileName, NotifyInfo->Filter, NotifyInfo->Action,
+                    FALSE);
+        }
+    }
+
+    if (0 != FullFileName.Buffer)
+        FspFree(FullFileName.Buffer);
+
+    FspFree(NotifyWorkItem);
+
+    FspWgroupDecrement(&FsvolDeviceExtension->VolumeNotifyWgroup);
+    if (Unlock)
+    {
+        FspWgroupWait(&FsvolDeviceExtension->VolumeNotifyWgroup, KernelMode, FALSE, 0);
+        if (1 == InterlockedCompareExchange(&FsvolDeviceExtension->VolumeNotifyLock, 0, 1))
+            FspFsvolDeviceFileRenameReleaseOwner(FsvolDeviceObject, FsvolDeviceObject);
+    }
+
+    FspDeviceDereference(FsvolDeviceObject);
+
+    FsRtlExitFileSystem();
 }
 
 NTSTATUS FspVolumeWork(

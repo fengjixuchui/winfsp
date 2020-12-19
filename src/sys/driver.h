@@ -652,6 +652,28 @@ VOID FspIrpHookReset(PIRP Irp);
 PVOID FspIrpHookContext(PVOID Context);
 NTSTATUS FspIrpHookNext(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context);
 
+/* utility: wait groups
+ *
+ * A Wait Group is a synchronization primitive that encapsulates a counter.
+ * A Wait Group is considered signaled when the counter is 0 and non-signaled
+ * when the counter is non-0. (Wait Group functionality is similar to Golang's
+ * sync.WaitGroup.)
+ *
+ * Wait Groups must always be allocated in non-paged storage.
+ */
+typedef struct
+{
+    KEVENT Event;
+    LONG Count;
+    KSPIN_LOCK SpinLock;
+} FSP_WGROUP;
+VOID FspWgroupInitialize(FSP_WGROUP *Wgroup);
+VOID FspWgroupIncrement(FSP_WGROUP *Wgroup);
+VOID FspWgroupDecrement(FSP_WGROUP *Wgroup);
+VOID FspWgroupSignalPermanently(FSP_WGROUP *Wgroup);
+NTSTATUS FspWgroupWait(FSP_WGROUP *Wgroup,
+    KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER PTimeout);
+
 /* silos */
 typedef struct
 {
@@ -1124,6 +1146,8 @@ typedef struct
     KSPIN_LOCK InfoSpinLock;
     UINT64 InfoExpirationTime;
     FSP_FSCTL_VOLUME_INFO VolumeInfo;
+    LONG VolumeNotifyLock;
+    FSP_WGROUP VolumeNotifyWgroup;
     PNOTIFY_SYNC NotifySync;
     LIST_ENTRY NotifyList;
     FSP_STATISTICS *Statistics;
@@ -1182,7 +1206,9 @@ VOID FspDeviceDelete(PDEVICE_OBJECT DeviceObject);
 BOOLEAN FspDeviceReference(PDEVICE_OBJECT DeviceObject);
 VOID FspDeviceDereference(PDEVICE_OBJECT DeviceObject);
 VOID FspFsvolDeviceFileRenameAcquireShared(PDEVICE_OBJECT DeviceObject);
+BOOLEAN FspFsvolDeviceFileRenameTryAcquireShared(PDEVICE_OBJECT DeviceObject);
 VOID FspFsvolDeviceFileRenameAcquireExclusive(PDEVICE_OBJECT DeviceObject);
+BOOLEAN FspFsvolDeviceFileRenameTryAcquireExclusive(PDEVICE_OBJECT DeviceObject);
 VOID FspFsvolDeviceFileRenameSetOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner);
 VOID FspFsvolDeviceFileRenameRelease(PDEVICE_OBJECT DeviceObject);
 VOID FspFsvolDeviceFileRenameReleaseOwner(PDEVICE_OBJECT DeviceObject, PVOID Owner);
@@ -1328,6 +1354,8 @@ NTSTATUS FspVolumeTransactFsext(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeStop(
     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+NTSTATUS FspVolumeNotify(
+    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 NTSTATUS FspVolumeWork(
     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
 
@@ -1359,8 +1387,10 @@ typedef struct
     FAST_MUTEX HeaderFastMutex;
     SECTION_OBJECT_POINTERS SectionObjectPointers;
     KSPIN_LOCK NpInfoSpinLock;          /* allows to invalidate non-page Info w/o resources acquired */
+    UINT64 Security;
     UINT64 DirInfo;
     UINT64 StreamInfo;
+    UINT64 Ea;
 } FSP_FILE_NODE_NONPAGED;
 typedef struct FSP_FILE_NODE
 {
@@ -1391,11 +1421,9 @@ typedef struct FSP_FILE_NODE
     UINT64 ChangeTime;
     UINT32 EaSize;
     ULONG FileInfoChangeNumber;
-    UINT64 Security;
     ULONG SecurityChangeNumber;
     ULONG DirInfoChangeNumber;
     ULONG StreamInfoChangeNumber;
-    UINT64 Ea;
     ULONG EaChangeNumber;
     ULONG EaChangeCount;
     BOOLEAN TruncateOnClose;
@@ -1540,6 +1568,7 @@ BOOLEAN FspFileNodeReferenceSecurity(FSP_FILE_NODE *FileNode, PCVOID *PBuffer, P
 VOID FspFileNodeSetSecurity(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size);
 BOOLEAN FspFileNodeTrySetSecurity(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size,
     ULONG SecurityChangeNumber);
+VOID FspFileNodeInvalidateSecurity(FSP_FILE_NODE *FileNode);
 static inline
 ULONG FspFileNodeSecurityChangeNumber(FSP_FILE_NODE *FileNode)
 {
@@ -1573,6 +1602,7 @@ BOOLEAN FspFileNodeReferenceEa(FSP_FILE_NODE *FileNode, PCVOID *PBuffer, PULONG 
 VOID FspFileNodeSetEa(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size);
 BOOLEAN FspFileNodeTrySetEa(FSP_FILE_NODE *FileNode, PCVOID Buffer, ULONG Size,
     ULONG EaChangeNumber);
+VOID FspFileNodeInvalidateEa(FSP_FILE_NODE *FileNode);
 static inline
 ULONG FspFileNodeEaChangeNumber(FSP_FILE_NODE *FileNode)
 {
@@ -1582,6 +1612,9 @@ ULONG FspFileNodeEaChangeNumber(FSP_FILE_NODE *FileNode)
 }
 VOID FspFileNodeNotifyChange(FSP_FILE_NODE *FileNode, ULONG Filter, ULONG Action,
     BOOLEAN InvalidateCaches);
+VOID FspFileNodeInvalidateCachesAndNotifyChangeByName(PDEVICE_OBJECT FsvolDeviceObject,
+    PUNICODE_STRING FileName, ULONG Filter, ULONG Action,
+    BOOLEAN InvalidateParentCaches);
 NTSTATUS FspFileNodeProcessLockIrp(FSP_FILE_NODE *FileNode, PIRP Irp);
 NTSTATUS FspFileDescCreate(FSP_FILE_DESC **PFileDesc);
 VOID FspFileDescDelete(FSP_FILE_DESC *FileDesc);

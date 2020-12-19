@@ -152,6 +152,8 @@ FSP_FUSE_API void FSP_FUSE_API_NAME(fsp_fuse_exit)(struct fsp_fuse_env *env,
     struct fuse *f);
 FSP_FUSE_API int FSP_FUSE_API_NAME(fsp_fuse_exited)(struct fsp_fuse_env *env,
     struct fuse *f);
+FSP_FUSE_API int FSP_FUSE_API_NAME(fsp_fuse_notify)(struct fsp_fuse_env *env,
+    struct fuse *f, const char *path, uint32_t action);
 FSP_FUSE_API struct fuse_context *FSP_FUSE_API_NAME(fsp_fuse_get_context)(struct fsp_fuse_env *env);
 
 FSP_FUSE_SYM(
@@ -213,6 +215,13 @@ int fuse_exited(struct fuse *f),
 })
 
 FSP_FUSE_SYM(
+int fuse_notify(struct fuse *f, const char *path, uint32_t action),
+{
+    return FSP_FUSE_API_CALL(fsp_fuse_notify)
+        (fsp_fuse_env(), f, path, action);
+})
+
+FSP_FUSE_SYM(
 struct fuse_context *fuse_get_context(void),
 {
     return FSP_FUSE_API_CALL(fsp_fuse_get_context)
@@ -236,9 +245,8 @@ int fuse_interrupted(void),
 FSP_FUSE_SYM(
 int fuse_invalidate(struct fuse *f, const char *path),
 {
-    (void)f;
-    (void)path;
-    return -EINVAL;
+    return FSP_FUSE_API_CALL(fsp_fuse_notify)
+        (fsp_fuse_env(), f, path, 0);
 })
 
 FSP_FUSE_SYM(

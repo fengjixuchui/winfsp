@@ -186,6 +186,28 @@ FSP_FUSE_API struct fuse_chan *fsp_fuse_mount(struct fsp_fuse_env *env,
     }
     else if (
         (
+            '\\' == mountpoint[0] &&
+            '\\' == mountpoint[1] &&
+            ('?' == mountpoint[2] || '.' == mountpoint[2]) &&
+            '\\' == mountpoint[3]
+        ) &&
+        (
+            ('A' <= mountpoint[4] && mountpoint[4] <= 'Z') ||
+            ('a' <= mountpoint[4] && mountpoint[4] <= 'z')
+        ) &&
+        ':' == mountpoint[5] && '\0' == mountpoint[6])
+    {
+        MountPointBuf[0] = '\\';
+        MountPointBuf[1] = '\\';
+        MountPointBuf[2] = mountpoint[2];
+        MountPointBuf[3] = '\\';
+        MountPointBuf[4] = mountpoint[4];
+        MountPointBuf[5] = ':';
+        MountPointBuf[6] = '\0';
+        Size = 7 * sizeof(WCHAR);
+    }
+    else if (
+        (
             ('A' <= mountpoint[0] && mountpoint[0] <= 'Z') ||
             ('a' <= mountpoint[0] && mountpoint[0] <= 'z')
         ) &&
@@ -608,6 +630,115 @@ FSP_FUSE_API int FSP_FUSE_API_NAME(fsp_fuse_exited)(struct fsp_fuse_env *env,
     struct fuse *f)
 {
     return f->exited;
+}
+
+FSP_FUSE_API int fsp_fuse_notify(struct fsp_fuse_env *env,
+    struct fuse *f, const char *path, uint32_t action)
+{
+    PWSTR Path = 0;
+    int PathLength;
+    union
+    {
+        FSP_FSCTL_NOTIFY_INFO V;
+        UINT8 B[sizeof(FSP_FSCTL_NOTIFY_INFO) + FSP_FSCTL_TRANSACT_PATH_SIZEMAX];
+    } NotifyInfo;
+    NTSTATUS Result;
+    int result;
+
+    Result = FspPosixMapPosixToWindowsPath(path, &Path);
+    if (!NT_SUCCESS(Result))
+    {
+        result = -ENOMEM;
+        goto exit;
+    }
+
+    PathLength = lstrlenW(Path);
+    if (FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR) <= PathLength)
+    {
+        result = -ENAMETOOLONG;
+        goto exit;
+    }
+
+    NotifyInfo.V.Size = (UINT16)(sizeof(FSP_FSCTL_NOTIFY_INFO) + PathLength * sizeof(WCHAR));
+    NotifyInfo.V.Filter = 0;
+    NotifyInfo.V.Action = 0;
+    memcpy(NotifyInfo.V.FileNameBuf, Path, NotifyInfo.V.Size - sizeof(FSP_FSCTL_NOTIFY_INFO));
+
+    if (!f->VolumeParams.CaseSensitiveSearch)
+    {
+        /*
+         * Case-insensitive FUSE file systems do not normalize open file names, which means
+         * that the FSD automatically normalizes file names internally by uppercasing them.
+         *
+         * The FspFileSystemNotify API requires normalized names, so upper case the file name
+         * here in the case of case-insensitive file systems.
+         */
+        CharUpperBuffW(NotifyInfo.V.FileNameBuf, PathLength);
+    }
+
+    if (action & FSP_FUSE_NOTIFY_MKDIR)
+    {
+        NotifyInfo.V.Filter = FILE_NOTIFY_CHANGE_DIR_NAME;
+        NotifyInfo.V.Action = FILE_ACTION_ADDED;
+    }
+    else if (action & FSP_FUSE_NOTIFY_RMDIR)
+    {
+        NotifyInfo.V.Filter = FILE_NOTIFY_CHANGE_DIR_NAME;
+        NotifyInfo.V.Action = FILE_ACTION_REMOVED;
+    }
+    else if (action & FSP_FUSE_NOTIFY_CREATE)
+    {
+        NotifyInfo.V.Filter = FILE_NOTIFY_CHANGE_FILE_NAME;
+        NotifyInfo.V.Action = FILE_ACTION_ADDED;
+    }
+    else if (action & FSP_FUSE_NOTIFY_UNLINK)
+    {
+        NotifyInfo.V.Filter = FILE_NOTIFY_CHANGE_FILE_NAME;
+        NotifyInfo.V.Action = FILE_ACTION_REMOVED;
+    }
+
+    if (action & (FSP_FUSE_NOTIFY_CHMOD | FSP_FUSE_NOTIFY_CHOWN))
+    {
+        NotifyInfo.V.Filter |= FILE_NOTIFY_CHANGE_SECURITY;
+        if (0 == NotifyInfo.V.Action)
+            NotifyInfo.V.Action = FILE_ACTION_MODIFIED;
+    }
+
+    if (action & FSP_FUSE_NOTIFY_UTIME)
+    {
+        NotifyInfo.V.Filter |= FILE_NOTIFY_CHANGE_LAST_ACCESS | FILE_NOTIFY_CHANGE_LAST_WRITE;
+        if (0 == NotifyInfo.V.Action)
+            NotifyInfo.V.Action = FILE_ACTION_MODIFIED;
+    }
+
+    if (action & FSP_FUSE_NOTIFY_CHFLAGS)
+    {
+        NotifyInfo.V.Filter |= FILE_NOTIFY_CHANGE_ATTRIBUTES;
+        if (0 == NotifyInfo.V.Action)
+            NotifyInfo.V.Action = FILE_ACTION_MODIFIED;
+    }
+
+    if (action & FSP_FUSE_NOTIFY_TRUNCATE)
+    {
+        NotifyInfo.V.Filter |= FILE_NOTIFY_CHANGE_SIZE;
+        if (0 == NotifyInfo.V.Action)
+            NotifyInfo.V.Action = FILE_ACTION_MODIFIED;
+    }
+
+    Result = FspFileSystemNotify(f->FileSystem, &NotifyInfo.V, NotifyInfo.V.Size);
+    if (!NT_SUCCESS(Result))
+    {
+        result = -ENOMEM;
+        goto exit;
+    }
+
+    result = 0;
+
+exit:
+    if (0 != Path)
+        FspPosixDeletePath(Path);
+
+    return result;
 }
 
 FSP_FUSE_API struct fuse_context *fsp_fuse_get_context(struct fsp_fuse_env *env)

@@ -20,6 +20,7 @@
  */
 
 #include <windows.h>
+#include <dbghelp.h>
 #include <lm.h>
 #include <signal.h>
 #include <tlib/testsuite.h>
@@ -38,6 +39,7 @@ BOOLEAN OptCaseInsensitiveCmp = FALSE;
 BOOLEAN OptCaseInsensitive = FALSE;
 BOOLEAN OptCaseRandomize = FALSE;
 BOOLEAN OptFlushAndPurgeOnCleanup = FALSE;
+BOOLEAN OptNotify = FALSE;
 WCHAR OptOplock = 0;
 WCHAR OptMountPointBuf[MAX_PATH], *OptMountPoint;
 WCHAR OptShareNameBuf[MAX_PATH], *OptShareName, *OptShareTarget;
@@ -174,6 +176,37 @@ static void abort_handler(int sig)
 
 LONG WINAPI UnhandledExceptionHandler(struct _EXCEPTION_POINTERS *ExceptionInfo)
 {
+    if (0 != ExceptionInfo && 0 != ExceptionInfo->ExceptionRecord)
+    {
+        static CHAR OutBuf[128];
+        static union
+        {
+            SYMBOL_INFO V;
+            UINT8 Buf[sizeof(SYMBOL_INFO) + 64];
+        } Info;
+        LARGE_INTEGER Large;
+        Info.V.SizeOfStruct = sizeof(SYMBOL_INFO);
+        Info.V.MaxNameLen = 64;
+        if (SymFromAddr(GetCurrentProcess(),
+            (DWORD64)ExceptionInfo->ExceptionRecord->ExceptionAddress,
+            &Large.QuadPart,
+            &Info.V))
+        {
+            wsprintfA(OutBuf, "\nEXCEPTION 0x%lX at %s+0x%lX(0x%p)\n",
+                ExceptionInfo->ExceptionRecord->ExceptionCode,
+                Info.V.Name,
+                Large.LowPart,
+                ExceptionInfo->ExceptionRecord->ExceptionAddress);
+        }
+        else
+        {
+            wsprintfA(OutBuf, "\nEXCEPTION 0x%lX at 0x%p\n",
+                ExceptionInfo->ExceptionRecord->ExceptionCode,
+                ExceptionInfo->ExceptionRecord->ExceptionAddress);
+        }
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), OutBuf, lstrlenA(OutBuf), &Large.LowPart, 0);
+    }
+
     exiting();
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -211,12 +244,17 @@ int main(int argc, char *argv[])
     TESTSUITE(ea_tests);
     TESTSUITE(stream_tests);
     TESTSUITE(oplock_tests);
+    TESTSUITE(notify_tests);
     TESTSUITE(wsl_tests);
     TESTSUITE(volpath_tests);
 
+    SymInitialize(GetCurrentProcess(), 0, TRUE);
+
     atexit(exiting);
     signal(SIGABRT, abort_handler);
-    SetUnhandledExceptionFilter(UnhandledExceptionHandler);
+#pragma warning(suppress: 4996)
+    if (0 == getenv("WINFSP_TESTS_EXCEPTION_FILTER_DISABLE"))
+        SetUnhandledExceptionFilter(UnhandledExceptionHandler);
 
     for (int argi = 1; argc > argi; argi++)
     {
@@ -256,6 +294,11 @@ int main(int argc, char *argv[])
             else if (0 == strcmp("--flush-and-purge-on-cleanup", a))
             {
                 OptFlushAndPurgeOnCleanup = TRUE;
+                rmarg(argv, argc, argi);
+            }
+            else if (0 == strcmp("--notify", a))
+            {
+                OptNotify = TRUE;
                 rmarg(argv, argc, argi);
             }
             else if (0 == strcmp("--oplock=batch", a))

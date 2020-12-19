@@ -311,6 +311,85 @@ namespace Fsp.Interop
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    internal struct NotifyInfoInternal
+    {
+        internal const int FileNameBufSize = 1024 * 2/*FSP_FSCTL_TRANSACT_PATH_SIZEMAX*/;
+        internal static int FileNameBufOffset =
+            (int)Marshal.OffsetOf(typeof(NotifyInfoInternal), "FileNameBuf");
+
+        internal UInt16 Size;
+        internal UInt32 Filter;
+        internal UInt32 Action;
+        //internal unsafe fixed UInt16 FileNameBuf[];
+        internal unsafe fixed UInt16 FileNameBuf[FileNameBufSize];
+
+        internal unsafe void SetFileNameBuf(String Value)
+        {
+            fixed (UInt16 *P = FileNameBuf)
+            {
+                int Size = null != Value ? Value.Length : 0;
+                if (Size > FileNameBufSize)
+                    Size = FileNameBufSize;
+                for (int I = 0; Size > I; I++)
+                    P[I] = Value[I];
+                this.Size = (UInt16)(FileNameBufOffset + Size * 2);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Enumeration of all the possible values for NotifyInfo.Action
+    /// </summary>
+    public enum NotifyAction : UInt32
+    {
+        Added = 1,
+        Removed = 2,
+        Modified = 3,
+        RenamedOldName = 4,
+        RenamedNewName = 5,
+        AddedStream = 6,
+        RemovedStream = 7,
+        ModifiedStream = 8,
+        RemovedByDelete = 9,
+        IdNotTunnelled = 10,
+        TunnelledIdCollision = 11,
+    }
+
+
+    /// <summary>
+    /// Enumeration of all the possible values for NotifyInfo.Filter
+    /// </summary>
+    [Flags]
+    public enum NotifyFilter : UInt32
+    {
+        None              = 0x00000,
+        ChangeFileName    = 0x00001,
+        ChangeDirName     = 0x00002,
+        ChangeName        = ChangeFileName | ChangeDirName,
+        ChangeAttributes  = 0x00004,
+        ChangeSize        = 0x00008,
+        ChangeLastWrite   = 0x00010,
+        ChangeLastAccess  = 0x00020,
+        ChangeCreation    = 0x00040,
+        ChangeEa          = 0x00080,
+        ChangeSecurity    = 0x00100,
+        ChangeStreamName  = 0x00200,
+        ChangeStreamSize  = 0x00400,
+        ChangeStreamWrite = 0x00800,
+    }
+
+    /// <summary>
+    /// Contains file change notification information.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NotifyInfo
+    {
+        public String FileName;
+        public NotifyAction Action;
+        public NotifyFilter Filter;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     internal struct FullEaInformation
     {
         internal const int EaNameSize = 15 * 1024;
@@ -743,6 +822,18 @@ namespace Fsp.Interop
                 IntPtr FileSystem,
                 ref FspFsctlTransactRsp Response);
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            internal delegate Int32 FspFileSystemNotifyBegin(
+                IntPtr FileSystem,
+                UInt32 Timeout);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            internal delegate Int32 FspFileSystemNotifyEnd(
+                IntPtr FileSystem);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            internal delegate Int32 FspFileSystemNotify(
+                IntPtr FileSystem,
+                IntPtr NotifyInfo,
+                UIntPtr Size);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             internal unsafe delegate FspFileSystemOperationContext *FspFileSystemGetOperationContext();
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             internal delegate IntPtr FspFileSystemMountPointF(
@@ -802,6 +893,13 @@ namespace Fsp.Interop
                 IntPtr SingleEa,
                 IntPtr Ea,
                 UInt32 EaLength,
+                out UInt32 PBytesTransferred);
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            [return: MarshalAs(UnmanagedType.U1)]
+            internal delegate Boolean FspFileSystemAddNotifyInfo(
+                IntPtr NotifyInfo,
+                IntPtr Buffer,
+                UInt32 Length,
                 out UInt32 PBytesTransferred);
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             [return: MarshalAs(UnmanagedType.U1)]
@@ -930,6 +1028,9 @@ namespace Fsp.Interop
         internal static Proto.FspFileSystemStartDispatcher FspFileSystemStartDispatcher;
         internal static Proto.FspFileSystemStopDispatcher FspFileSystemStopDispatcher;
         internal static Proto.FspFileSystemSendResponse FspFileSystemSendResponse;
+        internal static Proto.FspFileSystemNotifyBegin FspFileSystemNotifyBegin;
+        internal static Proto.FspFileSystemNotifyEnd FspFileSystemNotifyEnd;
+        internal static Proto.FspFileSystemNotify _FspFileSystemNotify;
         internal static Proto.FspFileSystemGetOperationContext FspFileSystemGetOperationContext;
         internal static Proto.FspFileSystemMountPointF FspFileSystemMountPoint;
         internal static Proto.FspFileSystemSetOperationGuardStrategyF FspFileSystemSetOperationGuardStrategy;
@@ -941,6 +1042,7 @@ namespace Fsp.Interop
         internal static Proto.FspFileSystemCanReplaceReparsePoint _FspFileSystemCanReplaceReparsePoint;
         internal static Proto.FspFileSystemAddStreamInfo _FspFileSystemAddStreamInfo;
         internal static Proto.FspFileSystemAddEa _FspFileSystemAddEa;
+        internal static Proto.FspFileSystemAddNotifyInfo _FspFileSystemAddNotifyInfo;
         internal static Proto.FspFileSystemAcquireDirectoryBuffer FspFileSystemAcquireDirectoryBuffer;
         internal static Proto.FspFileSystemFillDirectoryBuffer FspFileSystemFillDirectoryBuffer;
         internal static Proto.FspFileSystemReleaseDirectoryBuffer FspFileSystemReleaseDirectoryBuffer;
@@ -1013,6 +1115,15 @@ namespace Fsp.Interop
         {
             return _FspFileSystemAddStreamInfo(IntPtr.Zero, Buffer, Length, out PBytesTransferred);
         }
+        internal static unsafe Boolean FspFileSystemAddNotifyInfo(
+            ref NotifyInfoInternal NotifyInfo,
+            IntPtr Buffer,
+            UInt32 Length,
+            out UInt32 PBytesTransferred)
+        {
+            fixed (NotifyInfoInternal *P = &NotifyInfo)
+                return _FspFileSystemAddNotifyInfo((IntPtr)P, Buffer, Length, out PBytesTransferred);
+        }
 
         internal delegate Int32 EnumerateEa(
             Object FileNode,
@@ -1068,6 +1179,35 @@ namespace Fsp.Interop
             out UInt32 PBytesTransferred)
         {
             return _FspFileSystemAddEa(IntPtr.Zero, Buffer, Length, out PBytesTransferred);
+        }
+
+        internal static unsafe Int32 FspFileSystemNotify(
+            IntPtr FileSystem,
+            NotifyInfo[] NotifyInfoArray)
+        {
+            int Length = 0;
+            for (int I = 0; NotifyInfoArray.Length > I; I++)
+            {
+                Length += NotifyInfoInternal.FileNameBufOffset +
+                    NotifyInfoArray[I].FileName.Length * 2;
+                Length = (Length + 7) & ~7; // align to next qword boundary
+            }
+
+            Byte[] Buffer = new Byte[Length];
+            UInt32 BytesTransferred = default(UInt32);
+            fixed (Byte *P = Buffer)
+            {
+                for (int I = 0; NotifyInfoArray.Length > I; I++)
+                {
+                    NotifyInfoInternal Internal = default(NotifyInfoInternal);
+                    Internal.Action = (UInt32)NotifyInfoArray[I].Action;
+                    Internal.Filter = (UInt32)NotifyInfoArray[I].Filter;
+                    Internal.SetFileNameBuf(NotifyInfoArray[I].FileName);
+                    FspFileSystemAddNotifyInfo(
+                        ref Internal, (IntPtr)P, (UInt32)Length, out BytesTransferred);
+                }
+                return _FspFileSystemNotify(FileSystem, (IntPtr)P, (UIntPtr)BytesTransferred);
+            }
         }
 
         internal unsafe static Object GetUserContext(
@@ -1330,6 +1470,9 @@ namespace Fsp.Interop
             FspFileSystemStartDispatcher = GetEntryPoint<Proto.FspFileSystemStartDispatcher>(Module);
             FspFileSystemStopDispatcher = GetEntryPoint<Proto.FspFileSystemStopDispatcher>(Module);
             FspFileSystemSendResponse = GetEntryPoint<Proto.FspFileSystemSendResponse>(Module);
+            FspFileSystemNotifyBegin = GetEntryPoint<Proto.FspFileSystemNotifyBegin>(Module);
+            FspFileSystemNotifyEnd = GetEntryPoint<Proto.FspFileSystemNotifyEnd>(Module);
+            _FspFileSystemNotify = GetEntryPoint<Proto.FspFileSystemNotify>(Module);
             FspFileSystemGetOperationContext = GetEntryPoint<Proto.FspFileSystemGetOperationContext>(Module);
             FspFileSystemMountPoint = GetEntryPoint<Proto.FspFileSystemMountPointF>(Module);
             FspFileSystemSetOperationGuardStrategy = GetEntryPoint<Proto.FspFileSystemSetOperationGuardStrategyF>(Module);
@@ -1341,6 +1484,7 @@ namespace Fsp.Interop
             _FspFileSystemCanReplaceReparsePoint = GetEntryPoint<Proto.FspFileSystemCanReplaceReparsePoint>(Module);
             _FspFileSystemAddStreamInfo = GetEntryPoint<Proto.FspFileSystemAddStreamInfo>(Module);
             _FspFileSystemAddEa = GetEntryPoint<Proto.FspFileSystemAddEa>(Module);
+            _FspFileSystemAddNotifyInfo = GetEntryPoint<Proto.FspFileSystemAddNotifyInfo>(Module);
             FspFileSystemAcquireDirectoryBuffer = GetEntryPoint<Proto.FspFileSystemAcquireDirectoryBuffer>(Module);
             FspFileSystemFillDirectoryBuffer = GetEntryPoint<Proto.FspFileSystemFillDirectoryBuffer>(Module);
             FspFileSystemReleaseDirectoryBuffer = GetEntryPoint<Proto.FspFileSystemReleaseDirectoryBuffer>(Module);
