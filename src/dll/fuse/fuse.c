@@ -20,6 +20,7 @@
  */
 
 #include <dll/fuse/library.h>
+#include <sddl.h>
 
 struct fuse_chan
 {
@@ -105,6 +106,8 @@ static struct fuse_opt fsp_fuse_core_opts[] =
     FUSE_OPT_KEY("ExactFileSystemName=", 'E'),
     FUSE_OPT_KEY("--ExactFileSystemName=", 'E'),
 
+    FUSE_OPT_KEY("FileSecurity=", 's'),
+    FUSE_OPT_KEY("--FileSecurity=", 's'),
     FSP_FUSE_CORE_OPT("UserName=", set_uid, 1),
     FUSE_OPT_KEY("UserName=", 'u'),
     FSP_FUSE_CORE_OPT("--UserName=", set_uid, 1),
@@ -266,6 +269,29 @@ FSP_FUSE_API int fsp_fuse_is_lib_option(struct fsp_fuse_env *env,
     return fsp_fuse_opt_match(env, fsp_fuse_core_opts, opt);
 }
 
+static int fsp_fuse_sddl_to_security(const char *Sddl, PUINT8 Security, PULONG PSecuritySize)
+{
+    PSECURITY_DESCRIPTOR SecurityDescriptor;
+    ULONG SecurityDescriptorSize;
+    int res = -1;
+
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+        Sddl, SDDL_REVISION_1, &SecurityDescriptor, &SecurityDescriptorSize))
+    {
+        if (*PSecuritySize >= SecurityDescriptorSize)
+        {
+            memcpy(Security, SecurityDescriptor, SecurityDescriptorSize);
+            *PSecuritySize = SecurityDescriptorSize;
+
+            res = 0;
+        }
+
+        LocalFree(SecurityDescriptor);
+    }
+
+    return res;
+}
+
 static int fsp_fuse_username_to_uid(const char *username, int *puid)
 {
     union
@@ -303,6 +329,63 @@ static int fsp_fuse_username_to_uid(const char *username, int *puid)
     return 0;
 }
 
+static int fsp_fuse_utf8towcs_trunc(
+    const char *Str, int StrLen,
+    PWSTR Wcs, int WcsLen)
+{
+    if (0 == StrLen)
+        return 0;
+
+    int Size = MultiByteToWideChar(CP_UTF8, 0, Str, StrLen, Wcs, WcsLen);
+    if (0 != Size)
+        return Size;
+
+    if (0 == WcsLen)
+        return 0;
+
+    PWSTR Buf = 0;
+
+    Size = MultiByteToWideChar(CP_UTF8, 0, Str, StrLen, 0, 0);
+    if (0 == Size)
+        goto exit;
+
+    Buf = MemAlloc(Size * sizeof(WCHAR));
+    if (0 == Buf)
+    {
+        SetLastError(ERROR_NO_SYSTEM_RESOURCES);
+        Size = 0;
+        goto exit;
+    }
+
+    Size = MultiByteToWideChar(CP_UTF8, 0, Str, StrLen, Buf, Size);
+    if (0 == Size)
+        goto exit;
+
+    if (-1 == StrLen)
+    {
+        if (Size >= WcsLen)
+        {
+            Size = WcsLen - 1;
+            memcpy(Wcs, Buf, Size * sizeof(WCHAR));
+            Wcs[Size] = L'\0';
+            Size++;
+        }
+        else
+            memcpy(Wcs, Buf, Size * sizeof(WCHAR));
+    }
+    else
+    {
+        if (Size >= WcsLen)
+            Size = WcsLen;
+        memcpy(Wcs, Buf, Size * sizeof(WCHAR));
+    }
+
+exit:
+    MemFree(Buf);
+
+    return Size;
+}
+
 static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
     struct fuse_args *outargs)
 {
@@ -317,6 +400,7 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
         FspServiceLog(EVENTLOG_ERROR_TYPE, L""
             FSP_FUSE_LIBRARY_NAME " options:\n"
             "    -o umask=MASK              set file permissions (octal)\n"
+            "    -o FileSecurity=SDDL       set file DACL (SDDL format)\n"
             "    -o create_umask=MASK       set newly created file permissions (octal)\n"
             "        -o create_file_umask=MASK      for files only\n"
             "        -o create_dir_umask=MASK       for directories only\n"
@@ -367,7 +451,7 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
             arg += sizeof "VolumePrefix=" - 1;
         else if ('V' == arg[2])
             arg += sizeof "--VolumePrefix=" - 1;
-        if (0 == MultiByteToWideChar(CP_UTF8, 0, arg, -1,
+        if (0 == fsp_fuse_utf8towcs_trunc(arg, -1,
             opt_data->VolumeParams.Prefix, sizeof opt_data->VolumeParams.Prefix / sizeof(WCHAR)))
             return -1;
         opt_data->VolumeParams.Prefix
@@ -383,7 +467,7 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
             arg += sizeof "FileSystemName=" - 1;
         else if ('F' == arg[2])
             arg += sizeof "--FileSystemName=" - 1;
-        if (0 == MultiByteToWideChar(CP_UTF8, 0, arg, -1,
+        if (0 == fsp_fuse_utf8towcs_trunc(arg, -1,
             opt_data->VolumeParams.FileSystemName + 5,
             sizeof opt_data->VolumeParams.FileSystemName / sizeof(WCHAR) - 5))
             return -1;
@@ -396,12 +480,24 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
             arg += sizeof "ExactFileSystemName=" - 1;
         else if ('E' == arg[2])
             arg += sizeof "--ExactFileSystemName=" - 1;
-        if (0 == MultiByteToWideChar(CP_UTF8, 0, arg, -1,
+        if (0 == fsp_fuse_utf8towcs_trunc(arg, -1,
             opt_data->VolumeParams.FileSystemName,
             sizeof opt_data->VolumeParams.FileSystemName / sizeof(WCHAR)))
             return -1;
         opt_data->VolumeParams.FileSystemName
             [sizeof opt_data->VolumeParams.FileSystemName / sizeof(WCHAR) - 1] = L'\0';
+        return 0;
+    case 's':
+        if ('F' == arg[0])
+            arg += sizeof "FileSecurity=" - 1;
+        else if ('F' == arg[2])
+            arg += sizeof "--FileSecurity=" - 1;
+        opt_data->FileSecuritySize = sizeof opt_data->FileSecurityBuf;
+        if (-1 == fsp_fuse_sddl_to_security(arg, opt_data->FileSecurityBuf, &opt_data->FileSecuritySize))
+        {
+            opt_data->FileSecuritySize = (ULONG)-1;
+            return -1;
+        }
         return 0;
     case 'u':
         if ('U' == arg[0])
@@ -428,7 +524,7 @@ static int fsp_fuse_core_opt_proc(void *opt_data0, const char *arg, int key,
     case 'v':
         arg += sizeof "volname=" - 1;
         opt_data->VolumeLabelLength = (UINT16)(sizeof(WCHAR) *
-            MultiByteToWideChar(CP_UTF8, 0, arg, lstrlenA(arg),
+            fsp_fuse_utf8towcs_trunc(arg, lstrlenA(arg),
             opt_data->VolumeLabel, sizeof opt_data->VolumeLabel / sizeof(WCHAR)));
         if (0 == opt_data->VolumeLabelLength)
             return -1;
@@ -470,7 +566,12 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
 
     if (-1 == fsp_fuse_core_opt_parse(env, args, &opt_data, /*help=*/1))
     {
-        if (-1 == opt_data.username_to_uid_result)
+        if ((ULONG)-1 == opt_data.FileSecuritySize)
+        {
+            ErrorMessage = L": invalid file security.";
+            goto fail;
+        }
+        else if (-1 == opt_data.username_to_uid_result)
         {
             ErrorMessage = L": invalid user or group name.";
             goto fail;
@@ -539,7 +640,7 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
     if (L'\0' == opt_data.VolumeParams.FileSystemName[0])
         memcpy(opt_data.VolumeParams.FileSystemName, L"FUSE", 5 * sizeof(WCHAR));
 
-    f = fsp_fuse_obj_alloc(env, sizeof *f);
+    f = fsp_fuse_obj_alloc(env, sizeof *f + opt_data.FileSecuritySize);
     if (0 == f)
         goto fail;
 
@@ -559,6 +660,11 @@ FSP_FUSE_API struct fuse *fsp_fuse_new(struct fsp_fuse_env *env,
     memcpy(&f->VolumeParams, &opt_data.VolumeParams, sizeof opt_data.VolumeParams);
     f->VolumeLabelLength = opt_data.VolumeLabelLength;
     memcpy(&f->VolumeLabel, &opt_data.VolumeLabel, opt_data.VolumeLabelLength);
+    if (0 != opt_data.FileSecuritySize)
+    {
+        memcpy(f->FileSecurityBuf, opt_data.FileSecurityBuf, opt_data.FileSecuritySize);
+        f->FileSecurity = f->FileSecurityBuf;
+    }
 
     Size = (lstrlenW(ch->MountPoint) + 1) * sizeof(WCHAR);
     f->MountPoint = fsp_fuse_obj_alloc(env, Size);
